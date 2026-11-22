@@ -1,6 +1,6 @@
 # `src/config.js` 代码导读与注释
 
-- **对应源码**：[config.js](../../src/config.js#L1-L293)
+- **对应源码**：[config.js](../../src/config.js#L1-L297)
 - **配置文件模板**：[config.example.yaml](../../config.example.yaml)
 - **所属层级**：统一配置与环境变量映射层
 
