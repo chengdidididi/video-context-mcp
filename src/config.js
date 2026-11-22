@@ -5,6 +5,10 @@ import YAML from 'yaml';
 
 export const PROJECT_ROOT = path.resolve(import.meta.dirname, '..');
 const EXAMPLE_CONFIG_PATH = path.join(PROJECT_ROOT, 'config.example.yaml');
+const IS_INSTALLED_IN_NODE_MODULES = PROJECT_ROOT.includes(`${path.sep}node_modules${path.sep}`);
+const DEFAULT_OUTPUT_PATH = IS_INSTALLED_IN_NODE_MODULES
+  ? path.join(os.homedir(), 'video-context-output')
+  : './output';
 
 let runtimeOutputDir = null;
 
@@ -18,7 +22,7 @@ export const REFERERS = {
 
 export const DEFAULT_CONFIG = {
   output: {
-    dir: './output',
+    dir: DEFAULT_OUTPUT_PATH,
   },
   auth: {
     bilibili_cookie: '',
