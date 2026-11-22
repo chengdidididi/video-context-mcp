@@ -1,0 +1,70 @@
+# Video Context MCP 统一配置文件模板
+# 复制为 config.yaml 使用。所有字段均可被同名外部环境变量覆盖：
+# 优先级：单次工具入参 > 启动参数 > 外部环境变量 (ENV) > config.yaml > 内置默认值
+
+output:
+  # MCP 请求产生的所有产物、拼图与流缓存根目录（相对路径基于项目根目录解析）
+  # 环境变量: VIDEO_CONTEXT_OUTPUT_DIR
+  dir: "./output"
+
+auth:
+  # Bilibili 登录 Cookie（获取 AI 字幕 ai-zh 与 >=480p 视频流必填）
+  # 支持直接粘贴浏览器请求头 Cookie 字符串 (buvid3=...; SESSDATA=...) 或多行 Netscape 格式文本
+  # 环境变量: BILIBILI_COOKIE
+  bilibili_cookie: ""
+
+  # 未配置 Bilibili Cookie 时是否允许降级为 360p 无 AI 字幕游客模式（默认 false 阻断提示）
+  # 环境变量: VIDEO_CONTEXT_ALLOW_GUEST
+  allow_guest_degraded: false
+
+sampling:
+  # Tier 2 视觉场景切换检测阈值 (0.05 - 0.95)
+  # 环境变量: VIDEO_CONTEXT_SCENE_THRESHOLD
+  scene_threshold: 0.25
+
+  # Tier 2 相邻采样帧最小防抖间隔（秒）
+  # 环境变量: VIDEO_CONTEXT_MIN_INTERVAL_SEC
+  min_interval_sec: 1.0
+
+  # Tier 2 无场景切换且无字幕时的最大保底间隔（秒）
+  # 环境变量: VIDEO_CONTEXT_MAX_INTERVAL_SEC
+  max_interval_sec: 8.0
+
+  # Tier 2 单视频全局最大抽帧数量上限
+  # 环境变量: VIDEO_CONTEXT_MAX_FRAMES
+  max_frames: 180
+
+  # Tier 3 局部显微镜默认抽帧间隔（秒）
+  # 环境变量: VIDEO_CONTEXT_CLIP_INTERVAL_SEC
+  clip_interval_sec: 0.5
+
+  # Tier 3 单次局部切片允许的最大时间跨度（秒）
+  # 环境变量: VIDEO_CONTEXT_CLIP_MAX_SPAN_SEC
+  clip_max_span_sec: 180
+
+grid:
+  # 网格列数与行数（默认 3x3）
+  # 环境变量: VIDEO_CONTEXT_GRID_COLS / VIDEO_CONTEXT_GRID_ROWS
+  cols: 3
+  rows: 3
+
+  # 单帧内容区宽高（px，Lanczos 等比缩放居中补黑边）
+  # 环境变量: VIDEO_CONTEXT_CELL_WIDTH / VIDEO_CONTEXT_CELL_HEIGHT
+  cell_width: 640
+  cell_height: 360
+
+  # 单帧顶部零遮挡纯黑时间戳栏高度（px）
+  # 环境变量: VIDEO_CONTEXT_HEADER_HEIGHT
+  header_height: 24
+
+  # 单元格分隔线宽度（px）与输出 JPEG 质量 (1 - 100)
+  # 环境变量: VIDEO_CONTEXT_GRID_GUTTER / VIDEO_CONTEXT_JPEG_QUALITY
+  gutter: 2
+  jpeg_quality: 85
+
+binaries:
+  # 外部依赖二进制路径覆盖（留空则自动从 PATH 及常见路径寻址）
+  # 环境变量: YTDLP_PATH / FFMPEG_PATH / FFPROBE_PATH
+  yt_dlp: ""
+  ffmpeg: ""
+  ffprobe: ""

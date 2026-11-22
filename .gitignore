@@ -1,0 +1,7 @@
+node_modules/
+config.yaml
+output/*
+!output/.gitkeep
+test/
+SPEC.md
+.DS_Store
