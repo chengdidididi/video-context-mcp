@@ -13,7 +13,6 @@
 | :--- | :--- | :--- |
 | [L9-L32](../../../src/platforms/ytdlp.js#L9-L32) | `buildBaseYtDlpArgs` | 构建安全公共参数（`--no-playlist`、`--no-warnings`、自动挂载非空 `--cookies`）。注意：针对 `bilibili` 不强覆盖 `--user-agent`，以保留 `yt-dlp` 内置 `curl-impersonate` 的浏览器指纹一致性。 |
 | [L51-L184](../../../src/platforms/ytdlp.js#L51-L184) | `extractSubtitlesFromYtDlpInfo` | **YouTube 自动字幕防 429 核心修复**：<br>- 人工字幕（`manualSubs`）优先选中文，其次原音与英文；<br>- **自动生成字幕（`autoSubs`）强制优先匹配 `/-orig$/i`（如 `en-orig` 原音识别轨）与视频原语言**，且优先挑选不含 `tlang=` 的直链，避开 YouTube 对未登录实时机器翻译轨的 `HTTP 429` 封锁与专有名词机翻失真。<br>- 若直链拉取失败，自动降级调用 `yt-dlp --skip-download --write-subs` 兜底。 |
-| [L189-L271](../../../src/platforms/ytdlp.js#L189-L271) | `extractYoutubeStoryboards` | 从 `info.formats` 中筛选分辨率最高的 `sb0/sb1` 格式，下载前 10 张雪碧图分片，并根据每个 `fragment.duration` 与网格行列数精确推算每一小格的时间戳写入 `sprites_index.json`。 |
-| [L277-L304](../../../src/platforms/ytdlp.js#L277-L304) | `FORMAT_SELECTORS` | **横竖屏双兼容清晰度回退链**：<br>- `tier2`：同时匹配横屏 `height=480` 与竖屏 Shorts `width=480`，若无 480p 自动**向上回退至 720p**（避免退回低码率 360p 导致文字糊化），最后兜底单流 `b`。<br>- `tier3`：优先匹配 `720p` → `1080p`。 |
-| [L309-L366](../../../src/platforms/ytdlp.js#L309-L366) | `ensureCachedVideoStream` | 下载纯视频流至 `cache/`；若 `source_std.*` 或更高清的 `source_hd.*` 已存在且文件完整，直接秒级复用不重复联网。 |
-| [L371-L417](../../../src/platforms/ytdlp.js#L371-L417) | `downloadVideoClipSection` | 利用 `yt-dlp --download-sections "*start-end"` 执行真正的 HTTP Range 区间拉流，使 2 小时超长视频只截取其中 30 秒时只需下载几 MB 数据。 |
+| [L189-L276](../../../src/platforms/ytdlp.js#L189-L276) | `extractYoutubeStoryboards` | 从 `info.formats` 中筛选分辨率最高的 `sb0/sb1` 格式，4 并发拉取前 10 张雪碧图分片并生成 `sprites_index.json`。 |
+| [L303-L377](../../../src/platforms/ytdlp.js#L303-L377) | `selectOptimalYtDlpFormat` | **JS 精准体积/解码选流器**：直接从 `info.formats` 中筛选短边匹配 `360p–480p`、直连 `https` 协议（避开体积暴涨 4 倍的 `m3u8` 切片流）、`≤35fps`（避开 `60fps` 翻倍体积与解码耗时）、纯视频轨且优先 H.264 (`avc1`) 的最小流。 |
+| [L382-L465](../../../src/platforms/ytdlp.js#L382-L465) | `ensureCachedVideoStream` | 优先通过 `--load-info-json` 复用已获取的元数据（彻底省去第二次网页请求与 Deno JS 挑战求解耗时），并开启 `--concurrent-fragments 4 --http-chunk-size 10M` 绕开单连接限速。 |

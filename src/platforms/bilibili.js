@@ -288,6 +288,7 @@ export async function downloadBilibiliDashStream({
   destDir,
   cookieHeader = '',
   wbiKeys = null,
+  targetShortSide = 360,
 }) {
   await fs.promises.mkdir(destDir, { recursive: true });
   const prefix = 'source_video';
@@ -334,16 +335,18 @@ export async function downloadBilibiliDashStream({
     return destPath;
   }
 
-  // Prefer 480p (id=32) -> upward fallback 720p (id=64) -> 360p (id=16); within same resolution prefer lower bandwidth (AV1/HEVC)
-  const targetOrder = [32, 64, 16, 80];
+  // Prefer 480p (id=32) -> 360p (id=16, when cell height <= 360) -> 720p (id=64), <=35fps, lowest bandwidth
+  const targetOrder = targetShortSide <= 360 ? [32, 16, 64, 80] : [32, 64, 16, 80];
   const scored = dashVideos
     .map((v) => {
       const qnIdx = targetOrder.indexOf(Number(v.id));
       const qnRank = qnIdx !== -1 ? qnIdx : 99;
+      const fpsRaw = parseFloat(String(v.frameRate || v.frame_rate || '30'));
+      const fpsRank = !Number.isFinite(fpsRaw) || fpsRaw <= 35 ? 0 : 1;
       const bw = Number(v.bandwidth || 999_999_999);
-      return { stream: v, qnRank, bw };
+      return { stream: v, qnRank, fpsRank, bw };
     })
-    .sort((a, b) => a.qnRank - b.qnRank || a.bw - b.bw);
+    .sort((a, b) => a.qnRank - b.qnRank || a.fpsRank - b.fpsRank || a.bw - b.bw);
 
   let lastErr = null;
   for (const cand of scored.slice(0, 4)) {

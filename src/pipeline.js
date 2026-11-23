@@ -9,9 +9,10 @@ import {
   saveConfigUpdates,
 } from './config.js';
 import {
+  encodeRgbCandidateToJpeg,
   extractLanczosFrames,
   probeVideo,
-  scanGrayscaleProbeStream,
+  scanSinglePassVideoStream,
 } from './media/ffmpeg.js';
 import { composeGrids } from './media/grid-composer.js';
 import { createTwoGateTracker, finalizeSamplePlan } from './media/sampler.js';
@@ -36,6 +37,8 @@ import {
 } from './platforms/ytdlp.js';
 import { writeTempNetscapeCookieFile } from './utils/http.js';
 import { roundSec } from './utils/time.js';
+
+const inFlightExtractions = new Map();
 
 function getBundlePaths(baseOutputDir, bundleId) {
   const bundleDir = path.join(baseOutputDir, bundleId);
@@ -83,6 +86,7 @@ async function withTempBilibiliCookieFile(cacheDir, fn) {
 export async function manageConfig(updates = {}) {
   const keyMap = {
     output_dir: 'output.dir',
+    keep_video_cache: 'output.keep_video_cache',
     bilibili_cookie: 'auth.bilibili_cookie',
     allow_guest_degraded: 'auth.allow_guest_degraded',
     probe_fps: 'sampling.probe_fps',
@@ -167,19 +171,43 @@ export async function getAuthStatus() {
  *  5. Extract Lanczos 640x360 frames & compose zero-occlusion timestamped 3x3 grids (grids/ + frames_index.json)
  *  6. Return ONLY compact summary stats and absolute file paths (zero inline text bloat).
  */
-export async function extractVideo({
-  url_or_id,
-  part,
-  output_dir,
-  probe_fps,
-  diff_threshold,
-  settle_threshold,
-  min_interval_sec,
-  max_interval_sec,
-  max_frames,
-  allow_guest_degraded,
-  force = false,
-}) {
+export async function extractVideo(options = {}) {
+  const { url_or_id, part, output_dir, force = false } = options;
+  const resolved = await resolveVideoInput(url_or_id, part);
+  const baseOutputDir = resolveOutputDir(output_dir);
+  await fs.promises.mkdir(baseOutputDir, { recursive: true });
+
+  const lockId = `${baseOutputDir}::${resolved.platform}:${resolved.bvid || resolved.aid || resolved.videoId}:p${resolved.part || 1}`;
+  if (!force && inFlightExtractions.has(lockId)) {
+    console.error(`[video-context] Joining in-flight extraction for ${lockId}...`);
+    return inFlightExtractions.get(lockId);
+  }
+
+  const runPromise = runExtractVideoInternal(options, resolved, baseOutputDir).finally(() => {
+    if (inFlightExtractions.get(lockId) === runPromise) {
+      inFlightExtractions.delete(lockId);
+    }
+  });
+
+  inFlightExtractions.set(lockId, runPromise);
+  return runPromise;
+}
+
+async function runExtractVideoInternal(
+  {
+    part,
+    probe_fps,
+    diff_threshold,
+    settle_threshold,
+    min_interval_sec,
+    max_interval_sec,
+    max_frames,
+    allow_guest_degraded,
+    force = false,
+  },
+  resolved,
+  baseOutputDir
+) {
   const { config } = loadEffectiveConfig();
   const effectiveProbeFps = probe_fps ?? config.sampling.probe_fps;
   const effectiveDiffThreshold = diff_threshold ?? config.sampling.diff_threshold;
@@ -187,24 +215,18 @@ export async function extractVideo({
   const effectiveMinInterval = min_interval_sec ?? config.sampling.min_interval_sec;
   const effectiveMaxInterval = max_interval_sec ?? config.sampling.max_interval_sec;
   const effectiveMaxFrames = max_frames ?? config.sampling.max_frames;
-
-  const resolved = await resolveVideoInput(url_or_id, part);
-  const baseOutputDir = resolveOutputDir(output_dir);
-  await fs.promises.mkdir(baseOutputDir, { recursive: true });
+  const keepVideoCache = Boolean(config.output?.keep_video_cache);
+  const targetShortSide = Math.min(config.grid.cell_width || 640, config.grid.cell_height || 360);
 
   let bundleId;
   let paths;
   let metaInfo;
-  let bvid = null;
-  let cid = null;
-  let biliAuth = null;
+  let videoPath;
 
   if (resolved.platform === 'bilibili') {
-    biliAuth = await ensureBilibiliAuth(allow_guest_degraded);
+    const biliAuth = await ensureBilibiliAuth(allow_guest_degraded);
     const cookieHeader = biliAuth.cookie_header || '';
     const view = await fetchBilibiliView(resolved, cookieHeader, biliAuth.wbi_keys);
-    bvid = view.bvid;
-    cid = view.cid;
     bundleId = `bilibili_${view.bvid}_p${view.part}`;
     paths = getBundlePaths(baseOutputDir, bundleId);
 
@@ -215,49 +237,85 @@ export async function extractVideo({
     await fs.promises.mkdir(paths.subtitlesDir, { recursive: true });
     await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
-    console.error(`[video-context] Fetching metadata, subtitles & sprites for ${bundleId}...`);
-    let { chapters, subtitleTrack, segments } = await fetchBilibiliSubtitlesAndChapters(
-      view.bvid,
-      view.cid,
-      cookieHeader,
-      biliAuth.wbi_keys
-    );
+    console.error(`[video-context] Fetching subtitles, sprites & compact stream concurrently for ${bundleId}...`);
 
-    if (segments.length === 0) {
-      const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
-      try {
-        await withTempBilibiliCookieFile(paths.cacheDir, async (tmpCookiePath) => {
-          const info = await dumpYtDlpInfo('bilibili', view.canonicalUrl, tmpCookiePath);
-          const ytSub = await extractSubtitlesFromYtDlpInfo(
-            info,
-            'bilibili',
-            view.canonicalUrl,
-            tmpCookiePath,
-            tempSubDir
-          );
-          if (ytSub.segments.length > 0) {
-            subtitleTrack = ytSub.subtitleTrack;
-            segments = ytSub.segments;
-          }
-        });
-      } catch {
-        // ignore fallback error
-      } finally {
-        await fs.promises.rm(tempSubDir, { recursive: true, force: true });
+    const fetchSubsTask = (async () => {
+      let { chapters, subtitleTrack, segments } = await fetchBilibiliSubtitlesAndChapters(
+        view.bvid,
+        view.cid,
+        cookieHeader,
+        biliAuth.wbi_keys
+      );
+
+      if (segments.length === 0) {
+        const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
+        try {
+          await withTempBilibiliCookieFile(paths.cacheDir, async (tmpCookiePath) => {
+            const info = await dumpYtDlpInfo('bilibili', view.canonicalUrl, tmpCookiePath);
+            const ytSub = await extractSubtitlesFromYtDlpInfo(
+              info,
+              'bilibili',
+              view.canonicalUrl,
+              tmpCookiePath,
+              tempSubDir
+            );
+            if (ytSub.segments.length > 0) {
+              subtitleTrack = ytSub.subtitleTrack;
+              segments = ytSub.segments;
+            }
+          });
+        } catch {
+          // ignore fallback error
+        } finally {
+          await fs.promises.rm(tempSubDir, { recursive: true, force: true });
+        }
       }
-    }
+      return { chapters, subtitleTrack, segments };
+    })();
 
-    const spritesRes = await fetchBilibiliVideoshot(
+    const fetchSpritesTask = fetchBilibiliVideoshot(
       view.bvid,
       view.cid,
       paths.spritesDir,
       cookieHeader
     );
 
+    const fetchVideoTask = (async () => {
+      try {
+        return await downloadBilibiliDashStream({
+          bvid: view.bvid,
+          cid: view.cid,
+          destDir: paths.cacheDir,
+          cookieHeader,
+          wbiKeys: biliAuth.wbi_keys,
+          targetShortSide,
+        });
+      } catch (err) {
+        console.error(
+          `[video-context] Direct DASH mirror failed (${err.message}); falling back to yt-dlp...`
+        );
+        return withTempBilibiliCookieFile(paths.cacheDir, (tmpCookiePath) =>
+          ensureCachedVideoStream({
+            platform: 'bilibili',
+            canonicalUrl: view.canonicalUrl,
+            cacheDir: paths.cacheDir,
+            cookieFilePath: tmpCookiePath,
+            targetShortSide,
+          })
+        );
+      }
+    })();
+
+    const [{ chapters, subtitleTrack, segments }, spritesRes, downloadedVideoPath] =
+      await Promise.all([fetchSubsTask, fetchSpritesTask, fetchVideoTask]);
+    videoPath = downloadedVideoPath;
+
     const transcriptMd = formatTranscriptMarkdown(segments, {
       title: view.title,
       author: view.author,
       platform: 'bilibili',
+      durationSec: view.duration_sec,
+      chapters,
       sourceUrl: view.canonicalUrl,
     });
     await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
@@ -310,27 +368,35 @@ export async function extractVideo({
     await fs.promises.mkdir(paths.subtitlesDir, { recursive: true });
     await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
-    console.error(`[video-context] Fetching metadata, subtitles & storyboards for ${bundleId}...`);
+    console.error(`[video-context] Resolving YouTube metadata for ${bundleId}...`);
     const info = await dumpYtDlpInfo('youtube', resolved.canonicalUrl, null);
 
+    console.error(`[video-context] Fetching subtitles, storyboards & compact stream concurrently for ${bundleId}...`);
     const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
-    let subtitleTrack = null;
-    let segments = [];
-    try {
-      const subRes = await extractSubtitlesFromYtDlpInfo(
-        info,
-        'youtube',
-        resolved.canonicalUrl,
-        null,
-        tempSubDir
-      );
-      subtitleTrack = subRes.subtitleTrack;
-      segments = subRes.segments;
-    } finally {
-      await fs.promises.rm(tempSubDir, { recursive: true, force: true });
-    }
+    const fetchSubsTask = extractSubtitlesFromYtDlpInfo(
+      info,
+      'youtube',
+      resolved.canonicalUrl,
+      null,
+      tempSubDir
+    ).finally(() => fs.promises.rm(tempSubDir, { recursive: true, force: true }));
 
-    const spritesRes = await extractYoutubeStoryboards(info, paths.spritesDir);
+    const fetchSpritesTask = extractYoutubeStoryboards(info, paths.spritesDir);
+    const fetchVideoTask = ensureCachedVideoStream({
+      platform: 'youtube',
+      canonicalUrl: resolved.canonicalUrl,
+      cacheDir: paths.cacheDir,
+      cookieFilePath: null,
+      info,
+      targetShortSide,
+    });
+
+    const [{ subtitleTrack, segments }, spritesRes, downloadedVideoPath] = await Promise.all([
+      fetchSubsTask,
+      fetchSpritesTask,
+      fetchVideoTask,
+    ]);
+    videoPath = downloadedVideoPath;
 
     const chapters = Array.isArray(info.chapters)
       ? info.chapters.map((ch) => ({
@@ -348,6 +414,8 @@ export async function extractVideo({
       title,
       author,
       platform: 'youtube',
+      durationSec,
+      chapters,
       sourceUrl: resolved.canonicalUrl,
     });
     await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
@@ -383,91 +451,94 @@ export async function extractVideo({
     };
   }
 
-  // Step 2: Cache pure video stream (480p -> 720p upward fallback)
-  console.error(`[video-context] Caching video stream for ${bundleId}...`);
-  let videoPath;
-  if (resolved.platform === 'bilibili' && bvid && cid) {
-    const cookieHeader = biliAuth?.cookie_header || '';
-    try {
-      videoPath = await downloadBilibiliDashStream({
-        bvid,
-        cid,
-        destDir: paths.cacheDir,
-        cookieHeader,
-        wbiKeys: biliAuth?.wbi_keys,
-      });
-    } catch (err) {
-      console.error(
-        `[video-context] Direct DASH mirror failed (${err.message}); falling back to yt-dlp...`
-      );
-      videoPath = await withTempBilibiliCookieFile(paths.cacheDir, (tmpCookiePath) =>
-        ensureCachedVideoStream({
-          platform: 'bilibili',
-          canonicalUrl: metaInfo.source_url,
-          cacheDir: paths.cacheDir,
-          cookieFilePath: tmpCookiePath,
-        })
-      );
-    }
-  } else {
-    videoPath = await ensureCachedVideoStream({
-      platform: resolved.platform,
-      canonicalUrl: metaInfo.source_url,
-      cacheDir: paths.cacheDir,
-      cookieFilePath: null,
-    });
-  }
-
-  // Step 3: Two-Gate + Cap grayscale probe stream analysis
-  const probe = await probeVideo(videoPath);
-  const durationSec = probe.durationSec || metaInfo.duration_sec || 10;
-  console.error(
-    `[video-context] Stream ready (${probe.width}x${probe.height}, ${Math.round(durationSec)}s). Scanning Two-Gate grayscale probe (${effectiveProbeFps} fps)...`
-  );
-
-  const tracker = createTwoGateTracker({
-    width: 160,
-    height: 90,
-    tileCols: 8,
-    tileRows: 6,
-    diffThreshold: effectiveDiffThreshold,
-    settleThreshold: effectiveSettleThreshold,
-    minIntervalSec: effectiveMinInterval,
-  });
-
-  await scanGrayscaleProbeStream(
-    videoPath,
-    (frameSlice, frameIdx, ts) => tracker.pushFrame(frameSlice, frameIdx, ts),
-    { probeFps: effectiveProbeFps, width: 160, height: 90 }
-  );
-
-  const rawCandidates = tracker.flush();
-  const samplePoints = finalizeSamplePlan({
-    rawCandidates,
-    subtitleSegments: metaInfo.segments,
-    durationSec,
-    minIntervalSec: effectiveMinInterval,
-    maxIntervalSec: effectiveMaxInterval,
-    maxFrames: effectiveMaxFrames,
-  });
-
-  const perGrid = config.grid.cols * config.grid.rows;
-  console.error(
-    `[video-context] Selected ${samplePoints.length} settled frames (from ${rawCandidates.length} raw visual changes) -> composing ${Math.ceil(samplePoints.length / perGrid)} ${config.grid.rows}x${config.grid.cols} grids...`
-  );
-
-  // Step 4: Extract Lanczos high-res frames & compose zero-occlusion timestamped grids
-  const tempFramesDir = path.join(paths.cacheDir, 'tmp_frames');
-  await fs.promises.rm(tempFramesDir, { recursive: true, force: true });
-  await fs.promises.rm(paths.gridsDir, { recursive: true, force: true });
-
+  // Step 2: Single-pass multi-threaded FFmpeg stream (Two-Gate + Cap + in-memory JPEG capture)
   let indexPayload;
+  let rawCandidatesCount = 0;
+  let durationSec = metaInfo.duration_sec || 10;
+
   try {
-    const extractedFrames = await extractLanczosFrames({
-      videoPath,
-      samplePoints,
-      tempFramesDir,
+    const probe = await probeVideo(videoPath);
+    durationSec = probe.durationSec || durationSec;
+    const cellW = config.grid.cell_width || 640;
+    const cellH = config.grid.cell_height || 360;
+
+    console.error(
+      `[video-context] Stream ready (${probe.width}x${probe.height}, ${Math.round(durationSec)}s). Running single-pass Two-Gate scan (${effectiveProbeFps} fps)...`
+    );
+
+    const tracker = createTwoGateTracker({
+      width: 160,
+      height: 90,
+      tileCols: 8,
+      tileRows: 6,
+      diffThreshold: effectiveDiffThreshold,
+      settleThreshold: effectiveSettleThreshold,
+      minIntervalSec: effectiveMinInterval,
+      maxIntervalSec: effectiveMaxInterval,
+      onEmit: (rgbBuf) => encodeRgbCandidateToJpeg(rgbBuf, cellW, cellH, 88),
     });
+
+    await scanSinglePassVideoStream(videoPath, tracker, {
+      probeFps: effectiveProbeFps,
+      cellWidth: cellW,
+      cellHeight: cellH,
+    });
+
+    const rawCandidates = tracker.flush();
+    rawCandidatesCount = rawCandidates.length;
+    const samplePoints = finalizeSamplePlan({
+      rawCandidates,
+      subtitleSegments: metaInfo.segments,
+      durationSec,
+      minIntervalSec: effectiveMinInterval,
+      maxIntervalSec: effectiveMaxInterval,
+      maxFrames: effectiveMaxFrames,
+    });
+
+    // Release unpicked candidate promises immediately
+    const chosenSet = new Set(samplePoints.map((p) => p.payload));
+    for (const c of rawCandidates) {
+      if (c.payload && !chosenSet.has(c.payload)) {
+        Promise.resolve(c.payload).catch(() => {});
+      }
+    }
+
+    const perGrid = config.grid.cols * config.grid.rows;
+    console.error(
+      `[video-context] Selected ${samplePoints.length} settled frames (from ${rawCandidatesCount} raw visual changes) -> composing ${Math.ceil(samplePoints.length / perGrid)} ${config.grid.rows}x${config.grid.cols} grids...`
+    );
+
+    await fs.promises.rm(paths.gridsDir, { recursive: true, force: true });
+
+    let extractedFrames = await Promise.all(
+      samplePoints.map(async (pt) => ({
+        frameNo: pt.frameNo,
+        timestampSec: pt.timestampSec,
+        trigger: pt.trigger,
+        frameBuffer: pt.payload ? await pt.payload : null,
+      }))
+    );
+
+    // Defensive fallback if any edge-case point lacked an in-memory buffer
+    const missing = extractedFrames.filter((f) => !f.frameBuffer);
+    if (missing.length > 0) {
+      const tempFramesDir = path.join(paths.cacheDir, 'tmp_frames');
+      try {
+        const recovered = await extractLanczosFrames({
+          videoPath,
+          samplePoints: missing,
+          tempFramesDir,
+          cellWidth: cellW,
+          cellHeight: cellH,
+        });
+        const recMap = new Map(recovered.map((r) => [r.frameNo, r.framePath]));
+        extractedFrames = extractedFrames.map((f) =>
+          f.frameBuffer ? f : { ...f, framePath: recMap.get(f.frameNo) }
+        );
+      } finally {
+        await fs.promises.rm(tempFramesDir, { recursive: true, force: true });
+      }
+    }
 
     const composed = await composeGrids({
       extractedFrames,
@@ -477,7 +548,9 @@ export async function extractVideo({
     });
     indexPayload = composed.indexPayload;
   } finally {
-    await fs.promises.rm(tempFramesDir, { recursive: true, force: true });
+    if (!keepVideoCache && paths?.cacheDir) {
+      await fs.promises.rm(paths.cacheDir, { recursive: true, force: true });
+    }
   }
 
   await fs.promises.writeFile(paths.framesIndexPath, JSON.stringify(indexPayload, null, 2), 'utf8');
@@ -491,9 +564,10 @@ export async function extractVideo({
       diff_threshold: effectiveDiffThreshold,
       settle_threshold: effectiveSettleThreshold,
       max_frames: effectiveMaxFrames,
-      raw_visual_events: rawCandidates.length,
+      raw_visual_events: rawCandidatesCount,
       selected_frames: indexPayload.total_frames,
       total_grids: indexPayload.total_grids,
+      video_cache_retained: keepVideoCache,
     },
     completed: true,
   };
@@ -515,19 +589,16 @@ function isBundleComplete(paths) {
 }
 
 /**
- * Return ONLY concise statistics and absolute file paths so MCP responses stay ultra-compact (~180 tokens).
+ * Return ONLY concise statistics and essential local file paths so MCP responses stay compact
+ * and prevent agents from redundantly loading both sprites and high-res grids.
  */
 async function buildPathsOnlyReturnPayload(paths) {
   const manifest = JSON.parse(await fs.promises.readFile(paths.manifestPath, 'utf8'));
   const framesIndex = JSON.parse(await fs.promises.readFile(paths.framesIndexPath, 'utf8'));
 
-  const spriteFiles = fs.existsSync(paths.spritesDir)
-    ? (await fs.promises.readdir(paths.spritesDir))
-        .filter((f) => /\.(jpg|jpeg|png|webp)$/i.test(f))
-        .sort()
-        .map((f) => path.join(paths.spritesDir, f))
-    : [];
-
+  const hasSubtitle = Boolean(manifest.subtitle_meta?.has_subtitle);
+  const spriteCount = manifest.sprites_meta?.sheet_count || 0;
+  const hasSprites = spriteCount > 0 && fs.existsSync(paths.spritesDir);
   const gridFiles = (framesIndex.grids || []).map((g) => path.join(paths.bundleDir, g.file));
 
   return {
@@ -539,23 +610,21 @@ async function buildPathsOnlyReturnPayload(paths) {
     title: manifest.title,
     author: manifest.author,
     duration_sec: manifest.duration_sec,
-    has_subtitle: Boolean(manifest.subtitle_meta?.has_subtitle),
+    has_subtitle: hasSubtitle,
     subtitle_segments: manifest.subtitle_meta?.segment_count || 0,
-    chapters_count: manifest.chapters?.length || 0,
-    sprite_sheets: spriteFiles.length,
+    chapters: manifest.chapters?.length > 0 ? manifest.chapters : undefined,
     total_frames: framesIndex.total_frames,
     total_grids: framesIndex.total_grids,
+    reading_guide: hasSubtitle
+      ? 'Read paths.transcript first (includes chapters & [MM:SS] lines), then selectively read only matching grid_files by timestamp. Skip sprites_dir when grid_files exist.'
+      : 'No subtitle track available; selectively read paths.grid_files by timestamp.',
     paths: {
       bundle_dir: paths.bundleDir,
-      manifest: paths.manifestPath,
-      transcript: paths.transcriptPath,
-      subtitles_json: paths.subtitlesJsonPath,
-      frames_index: paths.framesIndexPath,
-      sprites_dir: spriteFiles.length > 0 ? paths.spritesDir : null,
-      sprites_index: fs.existsSync(paths.spritesIndexPath) ? paths.spritesIndexPath : null,
-      sprite_files: spriteFiles,
-      grids_dir: paths.gridsDir,
+      transcript: hasSubtitle ? paths.transcriptPath : null,
       grid_files: gridFiles,
+      manifest: paths.manifestPath,
+      frames_index: paths.framesIndexPath,
+      sprites_dir: hasSprites ? paths.spritesDir : null,
     },
   };
 }

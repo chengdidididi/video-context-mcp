@@ -58,32 +58,37 @@ export function createTwoGateTracker({
   height = 90,
   tileCols = 8,
   tileRows = 6,
-  diffThreshold = 0.12,
+  diffThreshold = 0.15,
   settleThreshold = 0.045,
-  minIntervalSec = 0.4,
+  minIntervalSec = 0.8,
+  maxIntervalSec = 15.0,
   maxPendingWaitSec = 2.4,
+  onEmit = null,
 } = {}) {
   let refBuf = null;
   let prevBuf = null;
   let lastEmittedSec = -Infinity;
   let pending = null;
   const candidates = [];
+  const effectiveMaxGap = Math.max(maxIntervalSec, minIntervalSec * 3);
 
-  function emit(timestampSec, buf, noveltyScore, trigger) {
+  function emit(timestampSec, buf, noveltyScore, trigger, payload) {
     const rounded = roundSec(timestampSec, 2);
-    candidates.push({
+    const candidate = {
       timestampSec: rounded,
-      importance: Math.min(1.5, Math.max(0.1, noveltyScore)),
+      importance: Math.min(1.5, Math.max(0.08, noveltyScore)),
       trigger,
-    });
+      payload: onEmit ? onEmit(payload, rounded, trigger) : payload,
+    };
+    candidates.push(candidate);
     refBuf = Buffer.from(buf);
     lastEmittedSec = timestampSec;
     pending = null;
   }
 
-  function pushFrame(frameSlice, frameIndex, timestampSec) {
+  function pushFrame(frameSlice, frameIndex, timestampSec, framePayload = null) {
     if (frameIndex === 0 || !refBuf || !prevBuf) {
-      emit(timestampSec, frameSlice, 1.0, 'opening');
+      emit(timestampSec, frameSlice, 1.0, 'opening', framePayload ? Buffer.from(framePayload) : null);
       prevBuf = Buffer.from(frameSlice);
       return;
     }
@@ -97,21 +102,33 @@ export function createTwoGateTracker({
         vsRef.novelty >= diffThreshold
       ) {
         if (vsPrev.novelty <= settleThreshold) {
-          // Slow cumulative drift reached threshold while already settled
-          emit(timestampSec, frameSlice, vsRef.novelty, 'cumulative_drift');
+          emit(
+            timestampSec,
+            frameSlice,
+            vsRef.novelty,
+            'cumulative_drift',
+            framePayload ? Buffer.from(framePayload) : null
+          );
         } else {
-          // Enter Gate 2: wait for transition/scroll/animation to settle
           pending = {
             startSec: timestampSec,
             maxNovelty: vsRef.novelty,
             bestSec: timestampSec,
             bestBuf: Buffer.from(frameSlice),
+            bestPayload: framePayload ? Buffer.from(framePayload) : null,
             bestStepMotion: vsPrev.novelty,
           };
         }
+      } else if (timestampSec - lastEmittedSec >= effectiveMaxGap) {
+        emit(
+          timestampSec,
+          frameSlice,
+          0.08,
+          'static_fallback',
+          framePayload ? Buffer.from(framePayload) : null
+        );
       }
     } else {
-      // Cancel transient 1-frame glitch/flash if screen reverted back to refBuf
       if (vsRef.novelty < diffThreshold * 0.65) {
         pending = null;
       } else {
@@ -119,18 +136,29 @@ export function createTwoGateTracker({
         if (vsPrev.novelty <= pending.bestStepMotion) {
           pending.bestSec = timestampSec;
           pending.bestBuf = Buffer.from(frameSlice);
+          pending.bestPayload = framePayload ? Buffer.from(framePayload) : null;
           pending.bestStepMotion = vsPrev.novelty;
         }
 
         if (vsPrev.novelty <= settleThreshold) {
-          // Gate 2 passed: screen settled cleanly!
-          emit(timestampSec, frameSlice, pending.maxNovelty, 'settled_state');
+          emit(
+            timestampSec,
+            frameSlice,
+            pending.maxNovelty,
+            'settled_state',
+            framePayload ? Buffer.from(framePayload) : null
+          );
         } else if (timestampSec - pending.startSec >= maxPendingWaitSec) {
-          // Continuous action/panning exceeded wait window: emit least-blurred frame in window
           if (pending.bestSec - lastEmittedSec >= minIntervalSec) {
-            emit(pending.bestSec, pending.bestBuf, pending.maxNovelty, 'continuous_motion');
+            emit(pending.bestSec, pending.bestBuf, pending.maxNovelty, 'continuous_motion', pending.bestPayload);
           } else {
-            emit(timestampSec, frameSlice, pending.maxNovelty, 'continuous_motion');
+            emit(
+              timestampSec,
+              frameSlice,
+              pending.maxNovelty,
+              'continuous_motion',
+              framePayload ? Buffer.from(framePayload) : null
+            );
           }
         }
       }
@@ -141,7 +169,7 @@ export function createTwoGateTracker({
 
   function flush() {
     if (pending && pending.bestSec - lastEmittedSec >= minIntervalSec) {
-      emit(pending.bestSec, pending.bestBuf, pending.maxNovelty, 'settled_eof');
+      emit(pending.bestSec, pending.bestBuf, pending.maxNovelty, 'settled_eof', pending.bestPayload);
     }
     return candidates;
   }
@@ -179,6 +207,7 @@ export function finalizeSamplePlan({
         timestampSec: clampedTs,
         importance: c.importance + (nearSub ? 0.15 : 0),
         trigger: c.trigger,
+        payload: c.payload ?? null,
       };
     })
     .sort((a, b) => a.timestampSec - b.timestampSec);
@@ -251,5 +280,6 @@ export function finalizeSamplePlan({
     frameNo: idx + 1,
     timestampSec: roundSec(pt.timestampSec, 2),
     trigger: pt.trigger,
+    payload: pt.payload ?? null,
   }));
 }

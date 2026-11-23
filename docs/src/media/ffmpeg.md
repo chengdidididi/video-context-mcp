@@ -10,6 +10,6 @@
 
 | 行号范围 | 函数名 | 关键实现与 Code Review 关注点 |
 | :--- | :--- | :--- |
-| [L10-L35](../../src/media/ffmpeg.js#L10-L35) | `probeVideo(videoPath)` | 读取首条视频轨的真实像素宽高、编码格式与容器总时长。 |
-| [L41-L119](../../src/media/ffmpeg.js#L41-L119) | `scanGrayscaleProbeStream` | 启动 `ffmpeg -vf "fps=2.5,scale=160:90:flags=area" -pix_fmt gray -f rawvideo pipe:1`，每 `14,400` 字节切出一帧回调 `onFrame`，不写任何临时文件、不做图片编解码，内存占用恒定为 `O(1)`。 |
-| [L125-L187](../../src/media/ffmpeg.js#L125-L187) | `extractLanczosFrames` | 对精选出的时间戳并发执行 `-ss` 快速寻址 + `scale=640:360:flags=lanczos` 等比居中补黑边抽帧，并保留片尾 EOF `-0.3s` 自动回退重试保护。 |
+| [L11-L36](../../src/media/ffmpeg.js#L11-L36) | `probeVideo(videoPath)` | 读取首条视频轨的真实像素宽高、编码格式与容器总时长。 |
+| [L45-L170](../../src/media/ffmpeg.js#L45-L170) | `scanSinglePassVideoStream` & `encodeRgbCandidateToJpeg` | **单进程多线程一步式流管线**：仅启动 **1 个** `ffmpeg -threads 0` 进程按 `2.5 fps` 输出 `640×360` RGB24 裸流至内存管道；利用预计算对角双采样偏移表在 `0.04ms/帧` 内生成 `160×90` 抗锯齿灰度图喂给两道栅栏，且**仅对栅栏放行的候选帧**调用 `sharp` 编码为 `~35KB` 内存 JPEG Buffer，彻底省去 180 次 `ffmpeg -ss` 子进程创建与临时帧磁盘读写。 |
+| [L176-L321](../../src/media/ffmpeg.js#L176-L321) | `scanGrayscaleProbeStream` & `extractLanczosFrames` | 保留的兜底抽帧与纯灰度扫描辅助函数。 |

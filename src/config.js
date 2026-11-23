@@ -23,6 +23,7 @@ export const REFERERS = {
 export const DEFAULT_CONFIG = {
   output: {
     dir: DEFAULT_OUTPUT_PATH,
+    keep_video_cache: false,
   },
   auth: {
     bilibili_cookie: '',
@@ -57,6 +58,7 @@ export const DEFAULT_CONFIG = {
  */
 export const ENV_VAR_MAP = {
   'output.dir': { env: 'VIDEO_CONTEXT_OUTPUT_DIR', type: 'string' },
+  'output.keep_video_cache': { env: 'VIDEO_CONTEXT_KEEP_VIDEO_CACHE', type: 'boolean' },
   'auth.bilibili_cookie': { env: 'BILIBILI_COOKIE', type: 'string' },
   'auth.allow_guest_degraded': { env: 'VIDEO_CONTEXT_ALLOW_GUEST', type: 'boolean' },
   'sampling.probe_fps': { env: 'VIDEO_CONTEXT_PROBE_FPS', type: 'number' },

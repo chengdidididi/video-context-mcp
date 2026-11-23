@@ -250,13 +250,31 @@ function findSuffixPrefixOverlap(a, b) {
  */
 export function formatTranscriptMarkdown(segments, meta = {}) {
   const lines = [];
+  const maxSegSec = segments?.[segments.length - 1]?.end || 0;
+  const totalSec = Math.max(Number(meta.durationSec || 0), maxSegSec);
+  const forceHours = totalSec >= 3600;
+
   if (meta.title) {
     lines.push(`# ${meta.title}`);
     const metaParts = [];
     if (meta.author) metaParts.push(`Author: ${meta.author}`);
     if (meta.platform) metaParts.push(`Platform: ${meta.platform}`);
+    if (totalSec > 0) metaParts.push(`Duration: ${formatTranscriptTimestamp(totalSec, forceHours)}`);
     if (meta.sourceUrl) metaParts.push(`URL: ${meta.sourceUrl}`);
     if (metaParts.length > 0) lines.push(`> ${metaParts.join(' | ')}`);
+    lines.push('');
+  }
+
+  if (Array.isArray(meta.chapters) && meta.chapters.length > 0) {
+    lines.push('## Chapters');
+    for (const ch of meta.chapters) {
+      const startStr = formatTranscriptTimestamp(Number(ch.start_sec || 0), forceHours);
+      const endStr =
+        ch.end_sec !== undefined && ch.end_sec !== null
+          ? ` - ${formatTranscriptTimestamp(Number(ch.end_sec), forceHours)}`
+          : '';
+      lines.push(`- [${startStr}${endStr}] ${ch.title}`);
+    }
     lines.push('');
   }
 
@@ -265,8 +283,9 @@ export function formatTranscriptMarkdown(segments, meta = {}) {
     return lines.join('\n') + '\n';
   }
 
-  const maxSec = segments[segments.length - 1]?.end || 0;
-  const forceHours = maxSec >= 3600;
+  if (Array.isArray(meta.chapters) && meta.chapters.length > 0) {
+    lines.push('## Transcript');
+  }
 
   for (const seg of segments) {
     const ts = formatTranscriptTimestamp(seg.start, forceHours);

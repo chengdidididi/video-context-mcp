@@ -11,11 +11,11 @@ import {
 import { AuthRequiredError } from './platforms/auth.js';
 
 const SERVER_INSTRUCTIONS = `
-Video Context MCP packages deterministic YouTube and Bilibili video URLs/BV IDs into a unified local Context Bundle in a single call.
+Video Context MCP packages deterministic YouTube and Bilibili video URLs/BV IDs into a local Context Bundle in one call.
 Workflow:
-1. Only pass deterministic URLs, BV IDs, or YouTube Video IDs (never fuzzy video titles; search first if needed).
-2. Call video_extract once: it outputs metadata (manifest.json), cleaned transcript (transcript.md), progress-bar sprites (sprites/), Two-Gate settled 3x3 timestamped grids (grids/), and 2D timestamp matrix (frames_index.json), returning ONLY their local file paths.
-3. Read transcript.md first to locate relevant timestamps, then selectively read only the matching grid_xxx.jpg image files (each cell has a zero-occlusion top black bar "#FrameNo | Timestamp").
+1. Pass only deterministic URLs, BV IDs, av IDs, or 11-char YouTube Video IDs to video_extract (never fuzzy titles).
+2. Read paths.transcript (if non-null) first: it already contains metadata, chapters, and deduplicated [MM:SS] lines.
+3. Selectively read ONLY the matching grid_xxx.jpg files in paths.grid_files (filenames encode start-end timestamps, and each cell has a zero-occlusion "#FrameNo | Timestamp" top bar). Do NOT read sprites_dir, manifest, or frames_index when high-res grids are available.
 `.trim();
 
 function formatToolResponse(payload) {
@@ -59,17 +59,17 @@ export function createVideoContextMcpServer() {
   const server = new McpServer(
     {
       name: 'video-context-mcp',
-      version: '2.0.0',
+      version: '2.1.0',
     },
     {
       instructions: SERVER_INSTRUCTIONS,
     }
   );
 
-  // Tool 1: video_extract (Unified One-Shot Pipeline)
+  // Tool 1: video_extract (Unified One-Shot Pipeline with smart defaults)
   server.tool(
     'video_extract',
-    'One-shot video context extraction: download subtitles, native progress-bar sprites, and pure video stream; run Two-Gate (8x6 patch cumulative diff + motion settle) + max_frames cap to generate zero-occlusion 3x3 timestamped grids; return local file paths only.',
+    'One-shot video context extraction with pre-tuned defaults: fetches cleaned transcript, chapters, sprites, and settled 3x3 timestamped visual grids, auto-cleans temporary video cache, and returns concise local file paths.',
     {
       url_or_id: z
         .string()
@@ -84,29 +84,6 @@ export function createVideoContextMcpServer() {
         .string()
         .optional()
         .describe('Optional custom root output directory override for this request.'),
-      diff_threshold: z
-        .number()
-        .min(0.03)
-        .max(0.6)
-        .optional()
-        .describe('Override Gate 1 cumulative 8x6 patch visual diff threshold (default from config.yaml: 0.12).'),
-      settle_threshold: z
-        .number()
-        .min(0.01)
-        .max(0.25)
-        .optional()
-        .describe('Override Gate 2 motion-settle threshold (default from config.yaml: 0.045).'),
-      max_frames: z
-        .number()
-        .int()
-        .min(9)
-        .max(450)
-        .optional()
-        .describe('Override global maximum frames cap (default from config.yaml: 180).'),
-      allow_guest_degraded: z
-        .boolean()
-        .optional()
-        .describe('Override allow_guest_degraded for Bilibili without login cookie.'),
       force: z
         .boolean()
         .optional()
@@ -141,9 +118,13 @@ export function createVideoContextMcpServer() {
   // Tool 3: video_config
   server.tool(
     'video_config',
-    'Read current effective settings (and environment variable mapping) or persist setting updates directly into config.yaml.',
+    'Read current effective settings (and environment variable mapping) or persist common setting updates into config.yaml.',
     {
       output_dir: z.string().optional().describe('Persist default output directory (env: VIDEO_CONTEXT_OUTPUT_DIR).'),
+      keep_video_cache: z
+        .boolean()
+        .optional()
+        .describe('Keep temporary downloaded video stream in cache/ after grid extraction (default false; env: VIDEO_CONTEXT_KEEP_VIDEO_CACHE).'),
       bilibili_cookie: z
         .string()
         .optional()
@@ -152,48 +133,13 @@ export function createVideoContextMcpServer() {
         .boolean()
         .optional()
         .describe('Persist guest degraded fallback toggle (env: VIDEO_CONTEXT_ALLOW_GUEST).'),
-      probe_fps: z
-        .number()
-        .min(0.5)
-        .max(10)
-        .optional()
-        .describe('Persist grayscale probe stream FPS (env: VIDEO_CONTEXT_PROBE_FPS).'),
-      diff_threshold: z
-        .number()
-        .min(0.03)
-        .max(0.6)
-        .optional()
-        .describe('Persist Gate 1 cumulative patch diff threshold (env: VIDEO_CONTEXT_DIFF_THRESHOLD).'),
-      settle_threshold: z
-        .number()
-        .min(0.01)
-        .max(0.25)
-        .optional()
-        .describe('Persist Gate 2 motion-settle threshold (env: VIDEO_CONTEXT_SETTLE_THRESHOLD).'),
-      min_interval_sec: z
-        .number()
-        .min(0.2)
-        .optional()
-        .describe('Persist minimum debounce interval (env: VIDEO_CONTEXT_MIN_INTERVAL_SEC).'),
-      max_interval_sec: z
-        .number()
-        .min(2.0)
-        .optional()
-        .describe('Persist maximum static fallback interval (env: VIDEO_CONTEXT_MAX_INTERVAL_SEC).'),
       max_frames: z
         .number()
         .int()
         .min(9)
         .max(450)
         .optional()
-        .describe('Persist max frames cap (env: VIDEO_CONTEXT_MAX_FRAMES).'),
-      grid_cols: z.number().int().min(1).max(6).optional().describe('Persist grid columns (env: VIDEO_CONTEXT_GRID_COLS).'),
-      grid_rows: z.number().int().min(1).max(6).optional().describe('Persist grid rows (env: VIDEO_CONTEXT_GRID_ROWS).'),
-      cell_width: z.number().int().min(160).max(1920).optional().describe('Persist cell width px (env: VIDEO_CONTEXT_CELL_WIDTH).'),
-      cell_height: z.number().int().min(90).max(1080).optional().describe('Persist cell height px (env: VIDEO_CONTEXT_CELL_HEIGHT).'),
-      header_height: z.number().int().min(16).max(64).optional().describe('Persist top header bar height px (env: VIDEO_CONTEXT_HEADER_HEIGHT).'),
-      gutter: z.number().int().min(0).max(16).optional().describe('Persist grid gutter px (env: VIDEO_CONTEXT_GRID_GUTTER).'),
-      jpeg_quality: z.number().int().min(40).max(100).optional().describe('Persist JPEG quality (env: VIDEO_CONTEXT_JPEG_QUALITY).'),
+        .describe('Persist max frames cap per video (default 180; env: VIDEO_CONTEXT_MAX_FRAMES).'),
     },
     async (args) => {
       try {

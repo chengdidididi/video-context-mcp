@@ -13,8 +13,8 @@
 
 | 行号范围 | 导出项 | 关键实现与 Code Review 关注点 |
 | :--- | :--- | :--- |
-| [L19-L50](../../src/config.js#L19-L50) | `DEFAULT_CONFIG` | 定义 `output`、`auth`、`sampling`、`grid`、`binaries` 五大配置分组的安全默认值。 |
-| [L54-L74](../../src/config.js#L54-L74) | `ENV_VAR_MAP` | **环境变量对接总表**：将全部 19 个点路径（如 `output.dir`、`auth.bilibili_cookie`、`sampling.max_frames`）一一映射到外部环境变量（`VIDEO_CONTEXT_OUTPUT_DIR`、`BILIBILI_COOKIE` 等）并声明强类型（`string` / `boolean` / `number` / `integer`）。 |
+| [L23-L54](../../src/config.js#L23-L54) | `DEFAULT_CONFIG` | 定义 `output`（含默认 `keep_video_cache: false` 临时视频流用完即焚）、`auth`、`sampling`、`grid`、`binaries` 五大配置分组的高性能默认值。 |
+| [L59-L80](../../src/config.js#L59-L80) | `ENV_VAR_MAP` | **环境变量对接总表**：将全部 20 个点路径（如 `output.dir`、`output.keep_video_cache`、`auth.bilibili_cookie`、`sampling.max_frames`）一一映射到外部环境变量并声明强类型。 |
 | [L100-L136](../../src/config.js#L100-L136) | `loadEffectiveConfig()` | 按 `DEFAULT_CONFIG` → `config.yaml` → `process.env`（通过 `coerceValue` 自动完成字符串向布尔/数值转型）→ `runtimeOutputDir` 顺序合并，并记录当前生效的环境变量覆盖项 `activeEnvOverrides` 供状态诊断。 |
 | [L141-L169](../../src/config.js#L141-L169) | `saveConfigUpdates(updates)` | 使用 `YAML.parseDocument` AST 级修改节点（`doc.setIn`），在持久化更新 `config.yaml` 时**完整保留文件中的中文注释与排版**；若 `config.yaml` 尚未创建，自动基于 `config.example.yaml` 初始化。 |
 | [L182-L212](../../src/config.js#L182-L212) | `resolveOutputDir` / `getBilibiliCookieConfig` / `getGridSpec` | 封装具体领域的配置读取器，相对路径统一基于 `PROJECT_ROOT` 归一化，且明确标注 Cookie 来源（`env:BILIBILI_COOKIE` 或 `yaml:...`）。 |

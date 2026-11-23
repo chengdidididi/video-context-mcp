@@ -20,23 +20,23 @@ flowchart TD
         ConfigHub --> Pipeline
     end
 
-    subgraph Ingest["2. 寻址鉴权 + 字幕与雪碧图 + 纯视频流缓存"]
-        Pipeline --> UrlParse["url-parser.resolveVideoInput (URL / BV / av / b23.tv / YT ID 归一化)"]
+    subgraph Ingest["2. 寻址鉴权 + 并发拉取字幕/雪碧图/轻量纯视频流"]
+        Pipeline --> UrlParse["url-parser.resolveVideoInput + inFlight 并发防重锁"]
         UrlParse --> PlatformBranch{"平台分流"}
-        PlatformBranch -- "Bilibili" --> BiliAuth["auth.ensureBilibiliAuth (验 nav 登录态防静默降级 + 提取 WBI)"]
-        BiliAuth --> BiliFetch["bilibili.js: WBI view + ai-zh 字幕 + videoshot 雪碧图 + upos 4MB Range 视频流"]
-        PlatformBranch -- "YouTube (公开视频免 Cookie)" --> YtFetch["ytdlp.js: 元数据 + en-orig 原音字幕 + storyboard 雪碧图 + 480p/720p 视频流"]
-        BiliFetch --> SubClean["subtitles.js: 滚动重叠去重 + 短句合并 -> transcript.md"]
+        PlatformBranch -- "Bilibili" --> BiliAuth["auth.ensureBilibiliAuth (验 nav 登录态 + 提取 WBI)"]
+        BiliAuth --> BiliFetch["bilibili.js: 并发拉取 ai-zh 字幕 + videoshot + 480p/360p@<=30fps 4MB Range 视频流"]
+        PlatformBranch -- "YouTube (公开视频免 Cookie)" --> YtFetch["ytdlp.js: 复用 info.json 并发拉取 en-orig 字幕 + storyboard + 360p@30fps H.264 HTTPS DASH 流"]
+        BiliFetch --> SubClean["subtitles.js: 章节头注入 + 滚动重叠去重 + 短句合并 -> transcript.md"]
         YtFetch --> SubClean
     end
 
-    subgraph TwoGate["3. 两道栅栏 + 一个上限 视觉采样与拼图"]
-        SubClean --> Probe["ffmpeg.scanGrayscaleProbeStream (2.5fps 160x90 内存灰度流, O(1) 内存)"]
+    subgraph TwoGate["3. 单趟内存流式两道栅栏采样 + 拼图合成 + 临时视频即焚"]
+        SubClean --> Probe["ffmpeg.scanSinglePassVideoStream (单进程多线程 2.5fps RGB24 内存流 + 0.04ms 灰度降采样)"]
         Probe --> Gate1["栅栏 1: sampler.computePatchVisualDiff (8x6 局部块相对上一入选帧累积变化 >= 0.15)"]
-        Gate1 --> Gate2["栅栏 2: Change-then-Settle 动后取静检测 (跳过滚动模糊与转场残影)"]
+        Gate1 --> Gate2["栅栏 2: Change-then-Settle 动后取静检测 (仅对候选帧编码 ~35KB 内存 JPEG)"]
         Gate2 --> Cap["全局上限: finalizeSamplePlan (字幕加权 + 变化强度x时间间距优选裁剪 <= 180帧)"]
-        Cap --> Render["ffmpeg.extractLanczosFrames + grid-composer.composeGrids (24px 顶栏 SVG + 3x3 拼图)"]
-        Render --> Output["落盘 output/<bundle_id>/ 并仅向 Agent 返回精简统计与全部文件路径"]
+        Cap --> Render["grid-composer.composeGrids (24px 顶栏 SVG + 并发 3x3 拼图) + 自动清理 cache/ 临时视频流"]
+        Render --> Output["落盘 output/<bundle_id>/ 并仅向 Agent 返回精简统计与关键文件路径"]
     end
 ```
 

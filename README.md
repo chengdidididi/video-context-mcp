@@ -91,7 +91,8 @@ magpie library mcp add video-context --local timeout=300 \
 
 | `config.yaml` 字段 | 对应外部环境变量 | 默认值 | 说明 |
 | :--- | :--- | :---: | :--- |
-| `output.dir` | `VIDEO_CONTEXT_OUTPUT_DIR` | `"./output"` | 产物与流缓存统一输出根目录（`npx` 远程模式默认 `~/video-context-output`） |
+| `output.dir` | `VIDEO_CONTEXT_OUTPUT_DIR` | `"./output"` | 产物统一输出根目录（`npx` 远程模式默认 `~/video-context-output`） |
+| `output.keep_video_cache` | `VIDEO_CONTEXT_KEEP_VIDEO_CACHE` | `false` | 拼图合成后是否保留 `cache/` 下的临时原视频流（默认 `false` 用完即焚，零原片磁盘残留） |
 | `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
 | `auth.allow_guest_degraded` | `VIDEO_CONTEXT_ALLOW_GUEST` | `false` | 未配 B 站 Cookie 时是否允许降级为 360p 无 AI 字幕游客模式 |
 | `sampling.probe_fps` | `VIDEO_CONTEXT_PROBE_FPS` | `2.5` | 内存灰度探针流采样帧率（默认每 `0.4s` 扫描一次） |
@@ -111,9 +112,9 @@ magpie library mcp add video-context --local timeout=300 \
 ## 4. 暴露的 MCP 工具与输出结构
 
 ### MCP Tools
-- `video_extract`（**核心一步提取管线**）：单次调用完成字幕去重清洗、官方进度条雪碧图下载、纯视频流缓存，以及基于**「`0.4s` 灰度探针流 + `8×6` 局部块累积对比 + 动后取静 + 最大帧数优选封顶」**的 `3×3` 零遮挡顶栏时间戳拼图生成；**仅回传精简统计与已生成文件路径列表**。
+- `video_extract`（**核心一步提取管线**）：面向模型收敛了全部低层调优参数，仅需传入确定性 URL / BV 号即可一步完成：原音/AI 字幕去重合并（含章节头）、官方进度条雪碧图下载、`360p/480p@≤30fps` 轻量纯视频流并发快拉、**单趟多线程 FFmpeg 内存流式扫描（「`8×6` 局部块累积对比 + 动后取静 + 最大帧数优选封顶」）**、`3×3` 零遮挡顶栏时间戳拼图合成，并在落盘后**自动清除临时原视频缓存**；仅回传精简统计与关键文件路径。
 - `video_auth_status`：自检二进制依赖、当前生效输出目录、激活的环境变量覆盖项及 B 站实时登录态。
-- `video_config`：读取当前生效配置，或将配置修改无损持久化写回 `config.yaml`。
+- `video_config`：读取当前生效配置，或将常用配置无损持久化写回 `config.yaml`。
 - `video_read_image`：按需单张返回图片的 MCP `ImageContent`（兼容无本地文件读图能力的宿主客户端）。
 
 ### 标准 `output` 产物结构
@@ -121,13 +122,12 @@ magpie library mcp add video-context --local timeout=300 \
 output/
 └── <platform>_<video_id>_p<part>/
     ├── manifest.json            # 视频元信息、章节、分P列表与采样统计
-    ├── transcript.md            # 去重合并后的紧凑时间轴字幕（供 AI 直接按需读取）
+    ├── transcript.md            # 含元数据、章节目录与去重合并时间轴字幕（AI 首读文件）
     ├── frames_index.json        # 3x3 拼图二维时间矩阵与每帧触发类型详情
     ├── subtitles/
     │   └── subtitles.json       # 毫秒级结构化字幕数组
     ├── sprites/                 # 平台原生进度条预览雪碧图与时间索引
-    ├── grids/                   # 两道栅栏+上限精选的 3x3 零遮挡顶栏时间戳拼图
-    └── cache/                   # 纯视频流缓存（临时抽帧目录自动销毁）
+    └── grids/                   # 两道栅栏+上限精选的 3x3 零遮挡顶栏时间戳拼图（临时视频流已自动清理）
 ```
 
 ---

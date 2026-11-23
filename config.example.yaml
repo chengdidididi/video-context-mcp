@@ -3,9 +3,13 @@
 # 优先级：单次工具入参 > 启动参数 > 外部环境变量 (ENV) > config.yaml > 内置默认值
 
 output:
-  # MCP 请求产生的所有产物、拼图与流缓存根目录（相对路径基于项目根目录解析）
+  # MCP 请求产生的所有产物与拼图根目录（相对路径基于项目根目录解析）
   # 环境变量: VIDEO_CONTEXT_OUTPUT_DIR
   dir: "./output"
+
+  # 抽帧拼图完成后是否保留 cache/ 下的临时原视频流（默认 false 用完即删，避免占用磁盘）
+  # 环境变量: VIDEO_CONTEXT_KEEP_VIDEO_CACHE
+  keep_video_cache: false
 
 auth:
   # Bilibili 登录 Cookie（获取 AI 字幕 ai-zh 与 >=480p 视频流必填）

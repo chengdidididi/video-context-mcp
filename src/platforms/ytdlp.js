@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { REFERERS, resolveBinary, USER_AGENT } from '../config.js';
+import { resolveBinary } from '../config.js';
 import { parseVttOrSrt, parseYoutubeJson3 } from '../parsers/subtitles.js';
-import { runCommand } from '../utils/exec.js';
+import { mapWithConcurrency, runCommand } from '../utils/exec.js';
 import { downloadFile, fetchWithContext } from '../utils/http.js';
 import { roundSec } from '../utils/time.js';
 
@@ -12,15 +12,8 @@ function buildBaseYtDlpArgs(platform, cookieFilePath) {
     '--no-warnings',
   ];
 
-  // Keep yt-dlp's native curl-impersonate UA on Bilibili; only set custom UA for YouTube if needed
-  if (platform !== 'bilibili') {
-    args.push('--user-agent', USER_AGENT);
-  }
-
-  if (platform && REFERERS[platform]) {
-    args.push('--add-header', `Referer:${REFERERS[platform]}`);
-  }
-
+  // Never override yt-dlp's native per-client User-Agent (e.g. YouTube VisionOS/TV clients or Bilibili curl-impersonate),
+  // otherwise signed CDN stream URLs can 403 due to UA mismatch.
   if (cookieFilePath && fs.existsSync(cookieFilePath)) {
     const stat = fs.statSync(cookieFilePath);
     if (stat.size > 0) {
@@ -212,42 +205,49 @@ export async function extractYoutubeStoryboards(info, spritesDir) {
   const perSheet = rows * cols;
   const maxSheets = Math.min(bestSb.fragments.length, 10);
 
-  const downloadedFiles = [];
-  const sheetsMeta = [];
+  const fragTasks = [];
   let cursorSec = 0;
-
   for (let i = 0; i < maxSheets; i++) {
     const frag = bestSb.fragments[i];
-    if (!frag?.url) continue;
-    const fragDuration = Number(frag.duration || 0);
-    const filename = `sprite_${String(i + 1).padStart(2, '0')}.jpg`;
-    const destPath = path.join(spritesDir, filename);
-
-    try {
-      await downloadFile(frag.url, destPath, { platform: 'youtube' });
-      const tileInterval = perSheet > 0 && fragDuration > 0 ? fragDuration / perSheet : 2.0;
-      const sheetTimes = [];
-      for (let k = 0; k < perSheet; k++) {
-        const t = cursorSec + k * tileInterval;
-        if (info.duration && t > info.duration) break;
-        sheetTimes.push(roundSec(t, 2));
-      }
-
-      downloadedFiles.push(destPath);
-      sheetsMeta.push({
-        sheet_index: i + 1,
-        file: `sprites/${filename}`,
-        layout: [rows, cols],
-        tile_size: [bestSb.width || 160, bestSb.height || 90],
-        start_sec: sheetTimes[0] ?? roundSec(cursorSec, 2),
-        end_sec: sheetTimes[sheetTimes.length - 1] ?? roundSec(cursorSec + fragDuration, 2),
-        timestamps_sec: sheetTimes,
-      });
-    } catch {
-      // continue on individual sprite error
+    const fragDuration = Number(frag?.duration || 0);
+    if (frag?.url) {
+      fragTasks.push({ index: i, url: frag.url, startCursorSec: cursorSec, fragDuration });
     }
     cursorSec += fragDuration;
   }
+
+  const results = await mapWithConcurrency(fragTasks, 4, async (task) => {
+    const filename = `sprite_${String(task.index + 1).padStart(2, '0')}.jpg`;
+    const destPath = path.join(spritesDir, filename);
+    try {
+      await downloadFile(task.url, destPath, { platform: 'youtube' });
+      const tileInterval = perSheet > 0 && task.fragDuration > 0 ? task.fragDuration / perSheet : 2.0;
+      const sheetTimes = [];
+      for (let k = 0; k < perSheet; k++) {
+        const t = task.startCursorSec + k * tileInterval;
+        if (info.duration && t > info.duration) break;
+        sheetTimes.push(roundSec(t, 2));
+      }
+      return {
+        destPath,
+        meta: {
+          sheet_index: task.index + 1,
+          file: `sprites/${filename}`,
+          layout: [rows, cols],
+          tile_size: [bestSb.width || 160, bestSb.height || 90],
+          start_sec: sheetTimes[0] ?? roundSec(task.startCursorSec, 2),
+          end_sec: sheetTimes[sheetTimes.length - 1] ?? roundSec(task.startCursorSec + task.fragDuration, 2),
+          timestamps_sec: sheetTimes,
+        },
+      };
+    } catch {
+      return null;
+    }
+  });
+
+  const valid = results.filter(Boolean).sort((a, b) => a.meta.sheet_index - b.meta.sheet_index);
+  const downloadedFiles = valid.map((r) => r.destPath);
+  const sheetsMeta = valid.map((r) => r.meta);
 
   const indexData = {
     platform: 'youtube',
@@ -270,55 +270,180 @@ export async function extractYoutubeStoryboards(info, spritesDir) {
 }
 
 /**
- * Format selector: Prefer 480p (landscape height=480 or vertical width=480),
- * fallback UPWARD to 720p, fallback 360p..720p, fallback any video-only or muxed.
+ * Fallback CLI selector when info.formats is unavailable:
+ * Strictly prefer 360p-480p <=35fps direct HTTP/HTTPS video-only streams before falling back to 720p or HLS.
  */
 export const VIDEO_FORMAT_SELECTOR = [
-  'bv*[height=480][vcodec^=avc]',
-  'bv*[height=480]',
-  'bv*[width=480][vcodec^=avc]',
-  'bv*[width=480]',
-  'bv*[height=720][vcodec^=avc]',
-  'bv*[height=720]',
-  'bv*[width=720]',
-  'bv*[height<=720][height>=360]',
-  'bv*[width<=720][width>=360]',
-  'bv*[height<=480]',
-  'bv*',
+  'bv*[height>=360][height<=480][fps<=35][protocol^=http]',
+  'bv*[width>=360][width<=480][fps<=35][protocol^=http]',
+  'bv*[height>=360][height<=480][fps<=35]',
+  'b[height>=360][height<=480][fps<=35][protocol^=http]',
+  'bv*[height<=720][fps<=35][protocol^=http]',
+  'bv*[width<=720][fps<=35][protocol^=http]',
+  'bv*[height<=720][protocol^=http]',
+  'bv*[height<=720]',
   'b[height<=720]',
+  'bv*',
   'b',
 ].join('/');
 
 /**
- * Download pure video stream into cache/ (reuses existing cached file if present).
+ * Pick the optimal compact video format_id directly from yt-dlp info.formats:
+ *  1. Resolution sweet-spot: short side in [targetShortSide, 480] (360p/480p matches 640x360 cells with zero wasted pixels)
+ *  2. Direct HTTP/HTTPS DASH over bloated HLS m3u8 segments (e.g. avoids 359MB 360p m3u8 vs 77MB HTTPS DASH)
+ *  3. <=35fps over 60fps (halves download bytes & FFmpeg decode CPU)
+ *  4. Video-only over audio-muxed, sorted by smallest byte size (with slight preference for fast-decoding H.264/VP9).
+ */
+export function selectOptimalYtDlpFormat(info, targetShortSide = 360) {
+  const formats = Array.isArray(info?.formats) ? info.formats : [];
+  const durationSec = Math.max(10, Number(info?.duration || 300));
+  const idealMin = Math.max(240, Number(targetShortSide) || 360);
+  const idealMax = Math.max(480, idealMin);
+
+  const videoFormats = formats.filter(
+    (f) =>
+      f &&
+      f.format_id &&
+      f.vcodec &&
+      f.vcodec !== 'none' &&
+      !String(f.format_id).startsWith('sb') &&
+      f.ext !== 'mhtml'
+  );
+
+  if (videoFormats.length === 0) return null;
+
+  const scored = videoFormats.map((f) => {
+    const w = Number(f.width || 0);
+    const h = Number(f.height || 0);
+    const shortSide = w > 0 && h > 0 ? Math.min(w, h) : h || w || 0;
+
+    let resRank = 4;
+    if (shortSide >= idealMin && shortSide <= idealMax) resRank = 0;
+    else if (shortSide > idealMax && shortSide <= 720) resRank = 1;
+    else if (shortSide >= 240 && shortSide < idealMin) resRank = 2;
+    else if (shortSide > 720 && shortSide <= 1080) resRank = 3;
+
+    const proto = String(f.protocol || '');
+    const protoRank = /^https?$/i.test(proto) ? 0 : 1;
+
+    const fps = Number(f.fps || 0);
+    const fpsRank = !fps || fps <= 35 ? 0 : 1;
+
+    const isVideoOnly = !f.acodec || f.acodec === 'none';
+    const muxRank = isVideoOnly ? 0 : 1;
+
+    const rawBytes =
+      Number(f.filesize || f.filesize_approx || 0) ||
+      Number(f.vbr || f.tbr || 800) * 125 * durationSec;
+    const vcodec = String(f.vcodec || '').toLowerCase();
+    // Prefer H.264 (avc1) when within ~15% size of VP9/HEVC and ~35% of AV1 for 3x faster FFmpeg decode
+    const codecPenalty = vcodec.startsWith('av01')
+      ? 1.35
+      : vcodec.startsWith('avc') || vcodec.startsWith('h264')
+        ? 1.0
+        : 1.15;
+    const weightedBytes = rawBytes * codecPenalty;
+
+    return {
+      formatId: String(f.format_id),
+      shortSide,
+      fps,
+      proto,
+      rawBytes,
+      resRank,
+      protoRank,
+      fpsRank,
+      muxRank,
+      weightedBytes,
+    };
+  });
+
+  scored.sort(
+    (a, b) =>
+      a.resRank - b.resRank ||
+      a.protoRank - b.protoRank ||
+      a.fpsRank - b.fpsRank ||
+      a.muxRank - b.muxRank ||
+      a.weightedBytes - b.weightedBytes
+  );
+
+  return scored[0];
+}
+
+/**
+ * Download compact pure video stream into cache/ (reuses existing cached file or pre-fetched info JSON).
  */
 export async function ensureCachedVideoStream({
   platform,
   canonicalUrl,
   cacheDir,
   cookieFilePath,
+  info = null,
+  targetShortSide = 360,
 }) {
   await fs.promises.mkdir(cacheDir, { recursive: true });
   const prefix = 'source_video';
 
-  const existing = (await fs.promises.readdir(cacheDir)).find(
-    (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part') && !f.endsWith('.ytdl')
-  );
-  if (existing) {
-    const full = path.join(cacheDir, existing);
+  const findCompletedFile = async () => {
+    const files = await fs.promises.readdir(cacheDir);
+    const match = files.find(
+      (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part') && !f.endsWith('.ytdl')
+    );
+    if (!match) return null;
+    const full = path.join(cacheDir, match);
     const stat = await fs.promises.stat(full);
-    if (stat.size > 1024) {
-      return full;
-    }
-  }
+    return stat.size > 1024 ? full : null;
+  };
+
+  const existing = await findCompletedFile();
+  if (existing) return existing;
 
   const ytdlp = resolveBinary('yt-dlp');
   const outTemplate = path.join(cacheDir, `${prefix}.%(ext)s`);
+  const picked = info ? selectOptimalYtDlpFormat(info, targetShortSide) : null;
+  const formatArg = picked ? `${picked.formatId}/${VIDEO_FORMAT_SELECTOR}` : VIDEO_FORMAT_SELECTOR;
+
+  if (picked) {
+    const mb = picked.rawBytes ? `${(picked.rawBytes / 1048576).toFixed(1)}MB` : 'est';
+    console.error(
+      `[video-context] Selected format ${picked.formatId} (${picked.shortSide}p${picked.fps ? `@${picked.fps}fps` : ''}, ${picked.proto}, ~${mb})`
+    );
+  }
+
+  const speedArgs = ['--concurrent-fragments', '4', '--http-chunk-size', '10M'];
+
+  // Fast path: reuse already-dumped info JSON to skip duplicate webpage + Deno JS challenge solve (~7s saved)
+  if (info && info.id) {
+    const infoJsonPath = path.join(cacheDir, 'ytdlp_info.json');
+    try {
+      await fs.promises.writeFile(infoJsonPath, JSON.stringify(info), 'utf8');
+      const fastArgs = [
+        ...buildBaseYtDlpArgs(platform, cookieFilePath),
+        ...speedArgs,
+        '--load-info-json',
+        infoJsonPath,
+        '-f',
+        picked ? picked.formatId : VIDEO_FORMAT_SELECTOR,
+        '-o',
+        outTemplate,
+      ];
+      await runCommand(ytdlp, fastArgs, { timeoutMs: 240_000 });
+      const downloadedFast = await findCompletedFile();
+      if (downloadedFast) return downloadedFast;
+    } catch (err) {
+      console.error(
+        `[video-context] Fast info-json download fallback (${err.message.split('\n')[0]}); retrying direct URL...`
+      );
+    } finally {
+      await fs.promises.rm(infoJsonPath, { force: true });
+    }
+  }
 
   const args = [
     ...buildBaseYtDlpArgs(platform, cookieFilePath),
+    ...speedArgs,
     '-f',
-    VIDEO_FORMAT_SELECTOR,
+    formatArg,
     '-o',
     outTemplate,
     canonicalUrl,
@@ -326,14 +451,11 @@ export async function ensureCachedVideoStream({
 
   await runCommand(ytdlp, args, { timeoutMs: 300_000 });
 
-  const afterFiles = await fs.promises.readdir(cacheDir);
-  const downloaded = afterFiles.find(
-    (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part') && !f.endsWith('.ytdl')
-  );
+  const downloaded = await findCompletedFile();
   if (!downloaded) {
     throw new Error(`yt-dlp completed without producing video file in ${cacheDir}`);
   }
-  return path.join(cacheDir, downloaded);
+  return downloaded;
 }
 
 function escapeRegExp(str) {

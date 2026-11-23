@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { getGridSpec } from '../config.js';
+import { mapWithConcurrency } from '../utils/exec.js';
 import { formatFrameTimestamp, formatSlugTimestamp } from '../utils/time.js';
 
 /**
@@ -56,10 +57,21 @@ export async function composeGrids({
   const forceHours = maxTs >= 3600;
   const padDigits = Math.max(3, String(extractedFrames.length).length);
 
-  const gridsMeta = [];
   const totalGrids = Math.ceil(extractedFrames.length / perGrid);
+  const gridIndices = Array.from({ length: totalGrids }, (_, g) => g);
 
-  for (let g = 0; g < totalGrids; g++) {
+  const blackSlotPromise = sharp({
+    create: {
+      width: cellWidth,
+      height: totalCellHeight,
+      channels: 3,
+      background: { r: 0, g: 0, b: 0 },
+    },
+  })
+    .png()
+    .toBuffer();
+
+  const gridsMeta = await mapWithConcurrency(gridIndices, 4, async (g) => {
     const chunk = extractedFrames.slice(g * perGrid, (g + 1) * perGrid);
     const gridIndex = g + 1;
     const startSec = chunk[0].timestampSec;
@@ -68,7 +80,6 @@ export async function composeGrids({
     const filename = `grid_${String(gridIndex).padStart(3, '0')}_${formatSlugTimestamp(startSec)}-${formatSlugTimestamp(endSec)}.jpg`;
     const destPath = path.join(gridsDir, filename);
 
-    // Initialize 2D matrix [rows][cols] with null for empty trailing slots
     const matrixSec = Array.from({ length: rows }, () => Array(cols).fill(null));
     const frameRecords = [];
     const composites = [];
@@ -81,19 +92,7 @@ export async function composeGrids({
 
       const item = chunk[slot];
       if (!item) {
-        // Fill unused trailing slot with pure black
-        const blackSlot = await sharp({
-          create: {
-            width: cellWidth,
-            height: totalCellHeight,
-            channels: 3,
-            background: { r: 0, g: 0, b: 0 },
-          },
-        })
-          .png()
-          .toBuffer();
-
-        composites.push({ input: blackSlot, left, top });
+        composites.push({ input: await blackSlotPromise, left, top });
         continue;
       }
 
@@ -109,7 +108,7 @@ export async function composeGrids({
         top,
       });
       composites.push({
-        input: item.framePath,
+        input: item.frameBuffer || item.framePath,
         left,
         top: top + headerHeight,
       });
@@ -126,7 +125,6 @@ export async function composeGrids({
       });
     }
 
-    // Create base canvas (#1f1f1f acts as the 2px separator gutter between cells)
     await sharp({
       create: {
         width: canvasWidth,
@@ -136,10 +134,10 @@ export async function composeGrids({
       },
     })
       .composite(composites)
-      .jpeg({ quality: jpegQuality, mozjpeg: true })
+      .jpeg({ quality: jpegQuality })
       .toFile(destPath);
 
-    gridsMeta.push({
+    return {
       grid_index: gridIndex,
       file: `${relativeDirPrefix}/${filename}`,
       abs_path: destPath,
@@ -147,8 +145,10 @@ export async function composeGrids({
       end_sec: endSec,
       matrix_sec: matrixSec,
       frames: frameRecords,
-    });
-  }
+    };
+  });
+
+  gridsMeta.sort((a, b) => a.grid_index - b.grid_index);
 
   const indexPayload = {
     grid_layout: [rows, cols],
