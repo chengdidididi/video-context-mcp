@@ -18,29 +18,29 @@ auth:
   allow_guest_degraded: false
 
 sampling:
-  # Tier 2 视觉场景切换检测阈值 (0.05 - 0.95)
-  # 环境变量: VIDEO_CONTEXT_SCENE_THRESHOLD
-  scene_threshold: 0.25
+  # 灰度探针流采样帧率（默认 2.5 fps，即每 0.4s 扫描一次画面状态）
+  # 环境变量: VIDEO_CONTEXT_PROBE_FPS
+  probe_fps: 2.5
 
-  # Tier 2 相邻采样帧最小防抖间隔（秒）
+  # 第一道栅栏：8x6 局部块相对上一入选帧的累积视觉变化阈值 (0.04 - 0.60，越小越灵敏)
+  # 环境变量: VIDEO_CONTEXT_DIFF_THRESHOLD
+  diff_threshold: 0.15
+
+  # 第二道栅栏：动后取静（Settle）帧间稳定阈值 (0.01 - 0.25，低于此值视为翻页/滚动已停稳)
+  # 环境变量: VIDEO_CONTEXT_SETTLE_THRESHOLD
+  settle_threshold: 0.045
+
+  # 相邻入选帧最小防抖间隔（秒）
   # 环境变量: VIDEO_CONTEXT_MIN_INTERVAL_SEC
-  min_interval_sec: 1.0
+  min_interval_sec: 0.8
 
-  # Tier 2 无场景切换且无字幕时的最大保底间隔（秒）
+  # 长时间完全静止画面的最大保底间隔（秒）
   # 环境变量: VIDEO_CONTEXT_MAX_INTERVAL_SEC
-  max_interval_sec: 8.0
+  max_interval_sec: 15.0
 
-  # Tier 2 单视频全局最大抽帧数量上限
+  # 全局上限：单视频最大抽帧总数（超出时按「视觉变化强度 × 时间间距」自动优选裁剪）
   # 环境变量: VIDEO_CONTEXT_MAX_FRAMES
   max_frames: 180
-
-  # Tier 3 局部显微镜默认抽帧间隔（秒）
-  # 环境变量: VIDEO_CONTEXT_CLIP_INTERVAL_SEC
-  clip_interval_sec: 0.5
-
-  # Tier 3 单次局部切片允许的最大时间跨度（秒）
-  # 环境变量: VIDEO_CONTEXT_CLIP_MAX_SPAN_SEC
-  clip_max_span_sec: 180
 
 grid:
   # 网格列数与行数（默认 3x3）

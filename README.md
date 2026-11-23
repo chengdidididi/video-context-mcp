@@ -1,6 +1,6 @@
 # video-context-mcp
 
-将 **YouTube** 与 **Bilibili** 视频（确定性 URL / BV 号 / Video ID）解析并打包为多模态大模型（VLM / Agent）友好的本地上下文包（`3×3` 零遮挡顶栏时间戳拼图 + 二维时间矩阵 JSON + 去重合并时间轴字幕）。
+将 **YouTube** 与 **Bilibili** 视频（确定性 URL / BV 号 / Video ID）一步解析并打包为多模态大模型（VLM / Agent）友好的本地上下文包（`3×3` 零遮挡顶栏时间戳拼图 + 官方进度条雪碧图 + 二维时间矩阵 JSON + 去重合并时间轴字幕），**MCP 响应仅回传精简统计与已落盘文件路径**，避免大段文本与多轮调用损耗上下文 Token。
 
 ---
 
@@ -38,7 +38,7 @@ winget install OpenJS.NodeJS.LTS Gyan.FFmpeg yt-dlp.yt-dlp
   - **Name**：`video-context`
   - **Command**：`npx`（macOS GUI 若找不到环境变量可填 `/opt/homebrew/bin/npx`）
   - **Args**：`-y` `github:chengdidididi/video-context-mcp`
-  - **Timeout**：`300`（预留长视频流缓存与抽帧时间）
+  - **Timeout**：`300`
   - **Env**：填入 `VIDEO_CONTEXT_OUTPUT_DIR` 与 `BILIBILI_COOKIE`（见下方配置表），添加后为目标 Agent 打开开关即可。
 
 #### B. 标准 `mcp_config.json` 远程注册（Claude Desktop / Cursor / Antigravity / Cherry Studio 等）
@@ -61,13 +61,11 @@ winget install OpenJS.NodeJS.LTS Gyan.FFmpeg yt-dlp.yt-dlp
 }
 ```
 
-> **提示**：通过 `npx` 远程运行时，若未显式设置 `VIDEO_CONTEXT_OUTPUT_DIR`，产物默认输出至用户主目录下的 `~/video-context-output/`（避免落入 `~/.npm/_npx` 隐藏临时缓存目录）。
+> **提示**：通过 `npx` 远程运行时，若未显式设置 `VIDEO_CONTEXT_OUTPUT_DIR`，产物默认输出至用户主目录下的 `~/video-context-output/`。
 
 ---
 
 ### 方式二：克隆到本地目录部署与注册
-
-适合需要持久化保存在本地 `config.yaml` 或二次开发的场景：
 
 ```bash
 git clone https://github.com/chengdidididi/video-context-mcp.git
@@ -77,25 +75,7 @@ cp config.example.yaml config.yaml
 # 按需编辑 config.yaml 填入 output.dir 与 auth.bilibili_cookie
 ```
 
-本地挂载配置：
-
-```json
-{
-  "mcpServers": {
-    "video-context": {
-      "command": "node",
-      "args": [
-        "/path/to/video-context-mcp/bin/video-context-mcp.js"
-      ],
-      "env": {
-        "VIDEO_CONTEXT_OUTPUT_DIR": "/path/to/video-context-mcp/output"
-      }
-    }
-  }
-}
-```
-
-或在 Magpie 中注册本机路径：
+在 Magpie 中注册本机路径：
 
 ```bash
 magpie library mcp add video-context --local timeout=300 \
@@ -112,14 +92,14 @@ magpie library mcp add video-context --local timeout=300 \
 | `config.yaml` 字段 | 对应外部环境变量 | 默认值 | 说明 |
 | :--- | :--- | :---: | :--- |
 | `output.dir` | `VIDEO_CONTEXT_OUTPUT_DIR` | `"./output"` | 产物与流缓存统一输出根目录（`npx` 远程模式默认 `~/video-context-output`） |
-| `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（支持直接填浏览器请求头 `buvid3=...; SESSDATA=...`，用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
+| `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
 | `auth.allow_guest_degraded` | `VIDEO_CONTEXT_ALLOW_GUEST` | `false` | 未配 B 站 Cookie 时是否允许降级为 360p 无 AI 字幕游客模式 |
-| `sampling.scene_threshold` | `VIDEO_CONTEXT_SCENE_THRESHOLD` | `0.25` | Tier 2 FFmpeg 场景切换检测阈值（`0.05–0.95`） |
-| `sampling.min_interval_sec` | `VIDEO_CONTEXT_MIN_INTERVAL_SEC` | `1.0` | Tier 2 相邻采样帧最小防抖间隔（秒） |
-| `sampling.max_interval_sec` | `VIDEO_CONTEXT_MAX_INTERVAL_SEC` | `8.0` | Tier 2 最大静默保底抽帧间隔（秒） |
-| `sampling.max_frames` | `VIDEO_CONTEXT_MAX_FRAMES` | `180` | Tier 2 单视频全局最大抽帧上限 |
-| `sampling.clip_interval_sec` | `VIDEO_CONTEXT_CLIP_INTERVAL_SEC` | `0.5` | Tier 3 局部显微镜默认抽帧间隔（秒） |
-| `sampling.clip_max_span_sec` | `VIDEO_CONTEXT_CLIP_MAX_SPAN_SEC` | `180` | Tier 3 单次局部切片最大允许跨度（秒） |
+| `sampling.probe_fps` | `VIDEO_CONTEXT_PROBE_FPS` | `2.5` | 内存灰度探针流采样帧率（默认每 `0.4s` 扫描一次） |
+| `sampling.diff_threshold` | `VIDEO_CONTEXT_DIFF_THRESHOLD` | `0.15` | **第一道栅栏**：`8×6` 局部块相对上一入选帧的累积视觉变化阈值 |
+| `sampling.settle_threshold` | `VIDEO_CONTEXT_SETTLE_THRESHOLD` | `0.045` | **第二道栅栏**：动后取静（Settle）帧间稳定阈值（跳过滚动模糊与转场残影） |
+| `sampling.min_interval_sec` | `VIDEO_CONTEXT_MIN_INTERVAL_SEC` | `0.8` | 相邻入选帧最小防抖间隔（秒） |
+| `sampling.max_interval_sec` | `VIDEO_CONTEXT_MAX_INTERVAL_SEC` | `15.0` | 长时间完全静止画面的最大保底间隔（秒） |
+| `sampling.max_frames` | `VIDEO_CONTEXT_MAX_FRAMES` | `180` | **全局上限**：单视频最大抽帧总数（超出时按「变化强度 × 时间间距」自动优选裁剪） |
 | `grid.cols` / `grid.rows` | `VIDEO_CONTEXT_GRID_COLS` / `VIDEO_CONTEXT_GRID_ROWS` | `3` / `3` | 网格拼图列数与行数 |
 | `grid.cell_width` / `grid.cell_height` | `VIDEO_CONTEXT_CELL_WIDTH` / `VIDEO_CONTEXT_CELL_HEIGHT` | `640` / `360` | 单格画面内容宽高（px，Lanczos 等比居中补黑边） |
 | `grid.header_height` | `VIDEO_CONTEXT_HEADER_HEIGHT` | `24` | 单格顶部零遮挡纯黑时间戳栏高度（px） |
@@ -131,25 +111,22 @@ magpie library mcp add video-context --local timeout=300 \
 ## 4. 暴露的 MCP 工具与输出结构
 
 ### MCP Tools
+- `video_extract`（**核心一步提取管线**）：单次调用完成字幕去重清洗、官方进度条雪碧图下载、纯视频流缓存，以及基于**「`0.4s` 灰度探针流 + `8×6` 局部块累积对比 + 动后取静 + 最大帧数优选封顶」**的 `3×3` 零遮挡顶栏时间戳拼图生成；**仅回传精简统计与已生成文件路径列表**。
 - `video_auth_status`：自检二进制依赖、当前生效输出目录、激活的环境变量覆盖项及 B 站实时登录态。
 - `video_config`：读取当前生效配置，或将配置修改无损持久化写回 `config.yaml`。
-- `video_inspect`（**Tier 1 极速探针**）：1–3 秒内免视频流获取元信息、章节、去重合并后的 `transcript.md` 与平台原生进度条预览雪碧图 `sprites/`。
-- `video_extract_grids`（**Tier 2 全局标准档**）：本地缓存 `480p/720p` 纯视频流，融合场景切换 + 字幕语义锚点 + 保底间隔与优先级防抖，输出 `3×3` 零遮挡顶栏时间戳拼图 `grids/` 与二维时间矩阵 `frames_index.json`。
-- `video_extract_clip`（**Tier 3 局部显微镜**）：针对指定 `[start_time, end_time]` 区间（复用本地缓存或通过 HTTP Range 切片），按 `0.5s` 高密生成局部拼图或导出无水印高清原图（`output_mode: "raw_frames"`）。
 - `video_read_image`：按需单张返回图片的 MCP `ImageContent`（兼容无本地文件读图能力的宿主客户端）。
 
 ### 标准 `output` 产物结构
 ```text
 output/
 └── <platform>_<video_id>_p<part>/
-    ├── manifest.json            # 视频元信息、章节、分P列表与各阶段完成状态
-    ├── transcript.md            # 去重合并后的紧凑时间轴字幕（供 AI 直接阅读）
-    ├── frames_index.json        # Tier 2 拼图 3x3 二维时间矩阵与帧详情
+    ├── manifest.json            # 视频元信息、章节、分P列表与采样统计
+    ├── transcript.md            # 去重合并后的紧凑时间轴字幕（供 AI 直接按需读取）
+    ├── frames_index.json        # 3x3 拼图二维时间矩阵与每帧触发类型详情
     ├── subtitles/
     │   └── subtitles.json       # 毫秒级结构化字幕数组
-    ├── sprites/                 # Tier 1 平台原生进度条预览雪碧图与索引
-    ├── grids/                   # Tier 2 生成的 3x3 零遮挡顶栏时间戳拼图
-    ├── clips/                   # Tier 3 局部显微镜拼图或无水印高清原图
+    ├── sprites/                 # 平台原生进度条预览雪碧图与时间索引
+    ├── grids/                   # 两道栅栏+上限精选的 3x3 零遮挡顶栏时间戳拼图
     └── cache/                   # 纯视频流缓存（临时抽帧目录自动销毁）
 ```
 

@@ -1,7 +1,7 @@
 {
   "name": "video-context-mcp",
-  "version": "1.0.0",
-  "description": "MCP Server that converts YouTube and Bilibili videos into VLM-friendly Context Bundles (3x3 zero-occlusion timestamped grids, matrix JSON, and cleaned transcripts).",
+  "version": "2.0.0",
+  "description": "One-shot MCP Server that converts YouTube and Bilibili videos into VLM-friendly Context Bundles using Two-Gate (8x6 patch diff + motion settle) visual sampling.",
   "type": "module",
   "bin": {
     "video-context-mcp": "./bin/video-context-mcp.js"

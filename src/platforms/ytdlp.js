@@ -270,53 +270,37 @@ export async function extractYoutubeStoryboards(info, spritesDir) {
 }
 
 /**
- * Format selector strings per SPEC 4.1:
- * - Tier 2: Prefer 480p (landscape height=480 or vertical width=480), fallback UPWARD to 720p, fallback 360p..720p, fallback any video-only or muxed.
- * - Tier 3: Prefer 720p, fallback 1080p, fallback best video-only or muxed.
+ * Format selector: Prefer 480p (landscape height=480 or vertical width=480),
+ * fallback UPWARD to 720p, fallback 360p..720p, fallback any video-only or muxed.
  */
-export const FORMAT_SELECTORS = {
-  tier2: [
-    'bv*[height=480][vcodec^=avc]',
-    'bv*[height=480]',
-    'bv*[width=480][vcodec^=avc]',
-    'bv*[width=480]',
-    'bv*[height=720][vcodec^=avc]',
-    'bv*[height=720]',
-    'bv*[width=720]',
-    'bv*[height<=720][height>=360]',
-    'bv*[width<=720][width>=360]',
-    'bv*[height<=480]',
-    'bv*',
-    'b[height<=720]',
-    'b',
-  ].join('/'),
-
-  tier3: [
-    'bv*[height=720][vcodec^=avc]',
-    'bv*[height=720]',
-    'bv*[width=720]',
-    'bv*[height=1080][vcodec^=avc]',
-    'bv*[height=1080]',
-    'bv*[width=1080]',
-    'bv*',
-    'b',
-  ].join('/'),
-};
+export const VIDEO_FORMAT_SELECTOR = [
+  'bv*[height=480][vcodec^=avc]',
+  'bv*[height=480]',
+  'bv*[width=480][vcodec^=avc]',
+  'bv*[width=480]',
+  'bv*[height=720][vcodec^=avc]',
+  'bv*[height=720]',
+  'bv*[width=720]',
+  'bv*[height<=720][height>=360]',
+  'bv*[width<=720][width>=360]',
+  'bv*[height<=480]',
+  'bv*',
+  'b[height<=720]',
+  'b',
+].join('/');
 
 /**
- * Download pure video stream into .cache/ (reuses existing cached file if present).
+ * Download pure video stream into cache/ (reuses existing cached file if present).
  */
 export async function ensureCachedVideoStream({
   platform,
   canonicalUrl,
   cacheDir,
-  tier = 'tier2',
   cookieFilePath,
 }) {
   await fs.promises.mkdir(cacheDir, { recursive: true });
-  const prefix = tier === 'tier3' ? 'source_hd' : 'source_std';
+  const prefix = 'source_video';
 
-  // Reuse cached stream if already downloaded and non-empty
   const existing = (await fs.promises.readdir(cacheDir)).find(
     (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part') && !f.endsWith('.ytdl')
   );
@@ -328,26 +312,13 @@ export async function ensureCachedVideoStream({
     }
   }
 
-  // Also if requesting tier2 and tier3 HD is already cached, reuse tier3 HD directly!
-  if (tier === 'tier2') {
-    const existingHd = (await fs.promises.readdir(cacheDir)).find(
-      (f) => f.startsWith('source_hd.') && !f.endsWith('.part') && !f.endsWith('.ytdl')
-    );
-    if (existingHd) {
-      const fullHd = path.join(cacheDir, existingHd);
-      const stat = await fs.promises.stat(fullHd);
-      if (stat.size > 1024) return fullHd;
-    }
-  }
-
   const ytdlp = resolveBinary('yt-dlp');
   const outTemplate = path.join(cacheDir, `${prefix}.%(ext)s`);
-  const selector = FORMAT_SELECTORS[tier] || FORMAT_SELECTORS.tier2;
 
   const args = [
     ...buildBaseYtDlpArgs(platform, cookieFilePath),
     '-f',
-    selector,
+    VIDEO_FORMAT_SELECTOR,
     '-o',
     outTemplate,
     canonicalUrl,
@@ -363,57 +334,6 @@ export async function ensureCachedVideoStream({
     throw new Error(`yt-dlp completed without producing video file in ${cacheDir}`);
   }
   return path.join(cacheDir, downloaded);
-}
-
-/**
- * Stream-slice only [startSec, endSec] via yt-dlp --download-sections (Tier 3 range slicing).
- */
-export async function downloadVideoClipSection({
-  platform,
-  canonicalUrl,
-  startSec,
-  endSec,
-  clipCacheDir,
-  slug,
-  cookieFilePath,
-}) {
-  await fs.promises.mkdir(clipCacheDir, { recursive: true });
-  const prefix = `section_${slug}`;
-
-  const existing = (await fs.promises.readdir(clipCacheDir)).find(
-    (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part') && !f.endsWith('.ytdl')
-  );
-  if (existing) {
-    const full = path.join(clipCacheDir, existing);
-    const stat = await fs.promises.stat(full);
-    if (stat.size > 1024) return full;
-  }
-
-  const ytdlp = resolveBinary('yt-dlp');
-  const outTemplate = path.join(clipCacheDir, `${prefix}.%(ext)s`);
-  const sectionExpr = `*${startSec}-${endSec}`;
-
-  const args = [
-    ...buildBaseYtDlpArgs(platform, cookieFilePath),
-    '-f',
-    FORMAT_SELECTORS.tier3,
-    '--download-sections',
-    sectionExpr,
-    '-o',
-    outTemplate,
-    canonicalUrl,
-  ];
-
-  await runCommand(ytdlp, args, { timeoutMs: 180_000 });
-
-  const afterFiles = await fs.promises.readdir(clipCacheDir);
-  const downloaded = afterFiles.find(
-    (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part') && !f.endsWith('.ytdl')
-  );
-  if (!downloaded) {
-    throw new Error(`Failed to download clip section ${sectionExpr}`);
-  }
-  return path.join(clipCacheDir, downloaded);
 }
 
 function escapeRegExp(str) {

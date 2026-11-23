@@ -286,12 +286,11 @@ export async function downloadBilibiliDashStream({
   bvid,
   cid,
   destDir,
-  tier = 'tier2',
   cookieHeader = '',
   wbiKeys = null,
 }) {
   await fs.promises.mkdir(destDir, { recursive: true });
-  const prefix = tier === 'tier3' ? 'source_hd' : 'source_std';
+  const prefix = 'source_video';
   const existing = (await fs.promises.readdir(destDir)).find(
     (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part')
   );
@@ -304,7 +303,7 @@ export async function downloadBilibiliDashStream({
   const params = {
     bvid,
     cid,
-    qn: tier === 'tier3' ? 80 : 64,
+    qn: 64,
     fnval: 4048, // DASH
     fnver: 0,
     fourk: 1,
@@ -327,7 +326,6 @@ export async function downloadBilibiliDashStream({
 
   const dashVideos = json.data.dash?.video || [];
   if (dashVideos.length === 0) {
-    // Legacy durl MP4 fallback (common in guest 360p mode)
     const durl = json.data.durl?.[0];
     if (!durl) throw new Error('No DASH or durl video streams returned by Bilibili playurl');
     const urls = rankBilibiliCdnUrls([durl.url, ...(durl.backup_url || [])]);
@@ -336,10 +334,8 @@ export async function downloadBilibiliDashStream({
     return destPath;
   }
 
-  // Score DASH streams:
-  // Tier 2: 480p (id=32) > 720p (id=64) > 360p (id=16) > others; within same resolution prefer lower bandwidth (AV1/HEVC saves 60% size on 30min+ videos!)
-  // Tier 3: 720p (id=64) > 1080p (id=80/112) > 480p (id=32) > others
-  const targetOrder = tier === 'tier3' ? [64, 80, 112, 32, 16] : [32, 64, 16, 80];
+  // Prefer 480p (id=32) -> upward fallback 720p (id=64) -> 360p (id=16); within same resolution prefer lower bandwidth (AV1/HEVC)
+  const targetOrder = [32, 64, 16, 80];
   const scored = dashVideos
     .map((v) => {
       const qnIdx = targetOrder.indexOf(Number(v.id));

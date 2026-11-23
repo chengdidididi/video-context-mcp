@@ -1,186 +1,255 @@
 import { roundSec } from '../utils/time.js';
 
-const PRIORITY = {
-  scene: 3,
-  subtitle: 2,
-  fallback: 1,
-};
+/**
+ * Compute 8x6 localized patch differences + global mean difference between two 8-bit grayscale frames.
+ * Captures both localized UI/popup/code/subtitle changes (via top2TileAvg) and broad scrolls/cuts (via meanDiff).
+ */
+export function computePatchVisualDiff(bufA, bufB, width = 160, height = 90, tileCols = 8, tileRows = 6) {
+  const tileW = Math.floor(width / tileCols);
+  const tileH = Math.floor(height / tileRows);
+  const normFactor = 1 / (tileW * tileH * 255);
+  const totalTiles = tileCols * tileRows;
+
+  let top1 = 0;
+  let top2 = 0;
+  let sumTiles = 0;
+
+  for (let tr = 0; tr < tileRows; tr++) {
+    const yStart = tr * tileH;
+    for (let tc = 0; tc < tileCols; tc++) {
+      const xStart = tc * tileW;
+      let absSum = 0;
+      for (let y = 0; y < tileH; y++) {
+        const rowOffset = (yStart + y) * width + xStart;
+        for (let x = 0; x < tileW; x++) {
+          const idx = rowOffset + x;
+          const diff = bufA[idx] - bufB[idx];
+          absSum += diff < 0 ? -diff : diff;
+        }
+      }
+      const tileDiff = absSum * normFactor;
+      sumTiles += tileDiff;
+      if (tileDiff >= top1) {
+        top2 = top1;
+        top1 = tileDiff;
+      } else if (tileDiff > top2) {
+        top2 = tileDiff;
+      }
+    }
+  }
+
+  const meanDiff = sumTiles / totalTiles;
+  const top2Avg = (top1 + top2) * 0.5;
+  const novelty = Math.max(meanDiff * 1.8, top2Avg);
+
+  return { novelty, top2Avg, meanDiff };
+}
 
 /**
- * Multi-signal frame sampling planner per SPEC 5.2:
- * Combines:
- *  1. Scene changes (gt(scene, threshold)) + opening anchor
- *  2. Subtitle semantic anchors: min(start + 0.4s, midpoint)
- *  3. Max-interval fallback: fills any gap > maxIntervalSec
- * Enforces priority-aware debounce (Δt >= minIntervalSec, preferring scene > subtitle > fallback).
+ * Two-Gate Stateful Visual Tracker:
+ *  - Gate 1 (Cumulative Patch Diff): Compares current frame against `refBuf` (the last emitted frame)
+ *    across 8x6 localized tiles so gradual scrolls, slow fades, small popups, and typed code lines are all caught.
+ *  - Gate 2 (Change-then-Settle): Once Gate 1 triggers, waits until step-to-step motion drops below `settleThreshold`
+ *    (so mid-scroll blur and half-faded transitions are skipped in favor of crisp settled frames),
+ *    with a `maxPendingWaitSec` cap so continuous live-action pans still emit their sharpest intermediate frame.
  */
-export function buildHybridSamplePlan({
-  durationSec,
-  sceneTimestamps = [],
+export function createTwoGateTracker({
+  width = 160,
+  height = 90,
+  tileCols = 8,
+  tileRows = 6,
+  diffThreshold = 0.12,
+  settleThreshold = 0.045,
+  minIntervalSec = 0.4,
+  maxPendingWaitSec = 2.4,
+} = {}) {
+  let refBuf = null;
+  let prevBuf = null;
+  let lastEmittedSec = -Infinity;
+  let pending = null;
+  const candidates = [];
+
+  function emit(timestampSec, buf, noveltyScore, trigger) {
+    const rounded = roundSec(timestampSec, 2);
+    candidates.push({
+      timestampSec: rounded,
+      importance: Math.min(1.5, Math.max(0.1, noveltyScore)),
+      trigger,
+    });
+    refBuf = Buffer.from(buf);
+    lastEmittedSec = timestampSec;
+    pending = null;
+  }
+
+  function pushFrame(frameSlice, frameIndex, timestampSec) {
+    if (frameIndex === 0 || !refBuf || !prevBuf) {
+      emit(timestampSec, frameSlice, 1.0, 'opening');
+      prevBuf = Buffer.from(frameSlice);
+      return;
+    }
+
+    const vsRef = computePatchVisualDiff(frameSlice, refBuf, width, height, tileCols, tileRows);
+    const vsPrev = computePatchVisualDiff(frameSlice, prevBuf, width, height, tileCols, tileRows);
+
+    if (!pending) {
+      if (
+        timestampSec - lastEmittedSec >= minIntervalSec &&
+        vsRef.novelty >= diffThreshold
+      ) {
+        if (vsPrev.novelty <= settleThreshold) {
+          // Slow cumulative drift reached threshold while already settled
+          emit(timestampSec, frameSlice, vsRef.novelty, 'cumulative_drift');
+        } else {
+          // Enter Gate 2: wait for transition/scroll/animation to settle
+          pending = {
+            startSec: timestampSec,
+            maxNovelty: vsRef.novelty,
+            bestSec: timestampSec,
+            bestBuf: Buffer.from(frameSlice),
+            bestStepMotion: vsPrev.novelty,
+          };
+        }
+      }
+    } else {
+      // Cancel transient 1-frame glitch/flash if screen reverted back to refBuf
+      if (vsRef.novelty < diffThreshold * 0.65) {
+        pending = null;
+      } else {
+        pending.maxNovelty = Math.max(pending.maxNovelty, vsRef.novelty);
+        if (vsPrev.novelty <= pending.bestStepMotion) {
+          pending.bestSec = timestampSec;
+          pending.bestBuf = Buffer.from(frameSlice);
+          pending.bestStepMotion = vsPrev.novelty;
+        }
+
+        if (vsPrev.novelty <= settleThreshold) {
+          // Gate 2 passed: screen settled cleanly!
+          emit(timestampSec, frameSlice, pending.maxNovelty, 'settled_state');
+        } else if (timestampSec - pending.startSec >= maxPendingWaitSec) {
+          // Continuous action/panning exceeded wait window: emit least-blurred frame in window
+          if (pending.bestSec - lastEmittedSec >= minIntervalSec) {
+            emit(pending.bestSec, pending.bestBuf, pending.maxNovelty, 'continuous_motion');
+          } else {
+            emit(timestampSec, frameSlice, pending.maxNovelty, 'continuous_motion');
+          }
+        }
+      }
+    }
+
+    prevBuf = Buffer.from(frameSlice);
+  }
+
+  function flush() {
+    if (pending && pending.bestSec - lastEmittedSec >= minIntervalSec) {
+      emit(pending.bestSec, pending.bestBuf, pending.maxNovelty, 'settled_eof');
+    }
+    return candidates;
+  }
+
+  return { pushFrame, flush };
+}
+
+/**
+ * Finalize Two-Gate candidates with:
+ *  1. Subtitle boundary synergy bonus (+0.15 importance when visual change aligns with speech segment start)
+ *  2. Sparse static fallback (only if screen stays completely unchanged for > maxIntervalSec)
+ *  3. Importance * Temporal-Spacing Cap ("一个上限"): prunes excess frames down to `maxFrames`
+ *     by iteratively dropping the weakest & most crowded point while preserving high-impact visual changes.
+ */
+export function finalizeSamplePlan({
+  rawCandidates = [],
   subtitleSegments = [],
-  minIntervalSec = 1.0,
-  maxIntervalSec = 8.0,
+  durationSec = 10,
+  minIntervalSec = 0.4,
+  maxIntervalSec = 15.0,
   maxFrames = 180,
 }) {
   const safeDuration = Math.max(0.5, Number(durationSec || 0));
   const safeEnd = Math.max(0.1, safeDuration - 0.15);
 
-  // Adaptive minimum interval if video is very long so total frames stay <= maxFrames
-  const effectiveMinInterval = Math.max(
-    minIntervalSec,
-    safeDuration / Math.max(9, maxFrames)
-  );
+  const subStarts = subtitleSegments
+    .map((s) => Number(s.start))
+    .filter((t) => Number.isFinite(t));
 
-  const candidates = [];
+  const points = rawCandidates
+    .map((c) => {
+      const clampedTs = roundSec(Math.min(safeEnd, Math.max(0, c.timestampSec)), 2);
+      const nearSub = subStarts.some((st) => Math.abs(st - clampedTs) <= 1.0);
+      return {
+        timestampSec: clampedTs,
+        importance: c.importance + (nearSub ? 0.15 : 0),
+        trigger: c.trigger,
+      };
+    })
+    .sort((a, b) => a.timestampSec - b.timestampSec);
 
-  // Always include an opening frame near the start
-  const openingTs = Math.min(0.5, safeEnd * 0.25);
-  candidates.push({
-    timestampSec: roundSec(openingTs, 2),
-    trigger: 'scene',
-    priority: PRIORITY.scene,
-  });
-
-  // 1. Scene change points (+0.1s stabilization so mid-transition crossfades settle)
-  for (const rawTs of sceneTimestamps) {
-    const stabilized = Math.min(safeEnd, Math.max(0, Number(rawTs) + 0.1));
-    candidates.push({
-      timestampSec: roundSec(stabilized, 2),
-      trigger: 'scene',
-      priority: PRIORITY.scene,
-    });
-  }
-
-  // 2. Subtitle semantic anchors
-  let lastSubAnchor = -Infinity;
-  for (const seg of subtitleSegments) {
-    if (seg.start === undefined) continue;
-    const mid = (seg.start + (seg.end ?? seg.start + 1.0)) / 2;
-    const anchor = Math.min(safeEnd, Math.max(0, Math.min(seg.start + 0.4, mid)));
-    // Pre-filter ultra-dense subtitle anchors using effectiveMinInterval
-    if (anchor - lastSubAnchor >= effectiveMinInterval) {
-      candidates.push({
-        timestampSec: roundSec(anchor, 2),
-        trigger: 'subtitle',
-        priority: PRIORITY.subtitle,
-      });
-      lastSubAnchor = anchor;
-    }
-  }
-
-  // Sort chronologically
-  candidates.sort((a, b) => a.timestampSec - b.timestampSec || b.priority - a.priority);
-
-  // Priority-aware debounce pass (Δt >= effectiveMinInterval)
-  const debounced = [];
-  for (const cand of candidates) {
-    if (debounced.length === 0) {
-      debounced.push({ ...cand });
+  // Deduplicate any clamped collisions < minIntervalSec (keep higher importance)
+  const deduped = [];
+  for (const pt of points) {
+    if (deduped.length === 0) {
+      deduped.push(pt);
       continue;
     }
-
-    const prev = debounced[debounced.length - 1];
-    const delta = cand.timestampSec - prev.timestampSec;
-
-    if (delta >= effectiveMinInterval) {
-      debounced.push({ ...cand });
-    } else if (cand.priority > prev.priority) {
-      // Higher-priority trigger (e.g. scene cut right after subtitle start) replaces lower-priority point
-      // as long as it doesn't violate interval with debounced[length - 2]
-      const beforePrev = debounced.length >= 2 ? debounced[debounced.length - 2] : null;
-      if (!beforePrev || cand.timestampSec - beforePrev.timestampSec >= effectiveMinInterval) {
-        debounced[debounced.length - 1] = { ...cand };
-      }
+    const prev = deduped[deduped.length - 1];
+    if (pt.timestampSec - prev.timestampSec >= minIntervalSec) {
+      deduped.push(pt);
+    } else if (pt.importance > prev.importance) {
+      deduped[deduped.length - 1] = pt;
     }
   }
 
-  // 3. Max-interval fallback pass: fill any silent/static gap > maxIntervalSec
-  const effectiveMaxInterval = Math.max(maxIntervalSec, effectiveMinInterval * 1.5);
+  if (deduped.length === 0) {
+    deduped.push({ timestampSec: roundSec(Math.min(0.4, safeEnd * 0.25), 2), importance: 1.0, trigger: 'opening' });
+  }
+
+  // Insert sparse fallback points ONLY in very long completely static gaps (> maxIntervalSec)
+  const effectiveMaxGap = Math.max(maxIntervalSec, minIntervalSec * 3);
   const withFallback = [];
-
-  const insertGapFallbacks = (fromSec, toSec) => {
-    const span = toSec - fromSec;
-    if (span <= effectiveMaxInterval) return;
-    const steps = Math.ceil(span / effectiveMaxInterval);
-    const stepSize = span / steps;
-    for (let k = 1; k < steps; k++) {
-      const fbTs = roundSec(Math.min(safeEnd, fromSec + k * stepSize), 2);
-      if (
-        fbTs - fromSec >= effectiveMinInterval &&
-        toSec - fbTs >= effectiveMinInterval
-      ) {
-        withFallback.push({
-          timestampSec: fbTs,
-          trigger: 'fallback',
-          priority: PRIORITY.fallback,
-        });
+  for (let i = 0; i < deduped.length; i++) {
+    withFallback.push(deduped[i]);
+    const curTs = deduped[i].timestampSec;
+    const nextTs = i + 1 < deduped.length ? deduped[i + 1].timestampSec : safeEnd;
+    const gap = nextTs - curTs;
+    if (gap > effectiveMaxGap) {
+      const steps = Math.ceil(gap / effectiveMaxGap);
+      const stepSec = gap / steps;
+      for (let k = 1; k < steps; k++) {
+        const fbTs = roundSec(Math.min(safeEnd, curTs + k * stepSec), 2);
+        if (fbTs - curTs >= minIntervalSec && nextTs - fbTs >= minIntervalSec) {
+          withFallback.push({
+            timestampSec: fbTs,
+            importance: 0.08,
+            trigger: 'static_fallback',
+          });
+        }
       }
-    }
-  };
-
-  if (debounced.length === 0) {
-    withFallback.push({
-      timestampSec: roundSec(openingTs, 2),
-      trigger: 'fallback',
-      priority: PRIORITY.fallback,
-    });
-    insertGapFallbacks(openingTs, safeEnd);
-  } else {
-    insertGapFallbacks(0, debounced[0].timestampSec);
-    for (let i = 0; i < debounced.length; i++) {
-      withFallback.push(debounced[i]);
-      const nextTs = i + 1 < debounced.length ? debounced[i + 1].timestampSec : safeEnd;
-      insertGapFallbacks(debounced[i].timestampSec, nextTs);
     }
   }
 
   withFallback.sort((a, b) => a.timestampSec - b.timestampSec);
 
-  // Enforce hard cap maxFrames by uniform stride if needed
-  let finalPoints = withFallback;
-  if (finalPoints.length > maxFrames) {
-    const sampled = [];
-    for (let i = 0; i < maxFrames; i++) {
-      const idx = Math.min(
-        finalPoints.length - 1,
-        Math.round((i * (finalPoints.length - 1)) / (maxFrames - 1))
-      );
-      sampled.push(finalPoints[idx]);
+  // Cap ("一个上限"): Importance * Min-Neighbor-Gap iterative pruning down to maxFrames
+  const capped = [...withFallback];
+  while (capped.length > maxFrames && capped.length > 2) {
+    let worstIdx = 1;
+    let worstKeepValue = Infinity;
+
+    for (let i = 1; i < capped.length - 1; i++) {
+      const leftGap = capped[i].timestampSec - capped[i - 1].timestampSec;
+      const rightGap = capped[i + 1].timestampSec - capped[i].timestampSec;
+      const minGap = Math.min(leftGap, rightGap);
+      const keepValue = capped[i].importance * (minGap + 0.05);
+      if (keepValue < worstKeepValue) {
+        worstKeepValue = keepValue;
+        worstIdx = i;
+      }
     }
-    finalPoints = sampled;
+    capped.splice(worstIdx, 1);
   }
 
-  return finalPoints.map((pt, idx) => ({
+  return capped.map((pt, idx) => ({
     frameNo: idx + 1,
     timestampSec: roundSec(pt.timestampSec, 2),
     trigger: pt.trigger,
   }));
-}
-
-/**
- * Build uniform interval sample points for Tier 3 clip microscope.
- */
-export function buildIntervalSamplePlan({
-  startSec,
-  endSec,
-  intervalSec = 0.5,
-  maxFrames = 240,
-}) {
-  const span = Math.max(0.1, endSec - startSec);
-  const effectiveInterval = Math.max(0.1, intervalSec, span / maxFrames);
-  const points = [];
-  let frameNo = 1;
-
-  for (let t = startSec; t <= endSec + 1e-6; t += effectiveInterval) {
-    const clamped = Math.min(endSec, t);
-    points.push({
-      frameNo: frameNo++,
-      timestampSec: roundSec(clamped, 2),
-      localSec: roundSec(clamped - startSec, 3),
-      trigger: 'interval',
-    });
-    if (frameNo > maxFrames) break;
-  }
-
-  return points;
 }

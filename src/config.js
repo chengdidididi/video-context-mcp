@@ -29,12 +29,12 @@ export const DEFAULT_CONFIG = {
     allow_guest_degraded: false,
   },
   sampling: {
-    scene_threshold: 0.25,
-    min_interval_sec: 1.0,
-    max_interval_sec: 8.0,
+    probe_fps: 2.5,
+    diff_threshold: 0.15,
+    settle_threshold: 0.045,
+    min_interval_sec: 0.8,
+    max_interval_sec: 15.0,
     max_frames: 180,
-    clip_interval_sec: 0.5,
-    clip_max_span_sec: 180,
   },
   grid: {
     cols: 3,
@@ -59,12 +59,12 @@ export const ENV_VAR_MAP = {
   'output.dir': { env: 'VIDEO_CONTEXT_OUTPUT_DIR', type: 'string' },
   'auth.bilibili_cookie': { env: 'BILIBILI_COOKIE', type: 'string' },
   'auth.allow_guest_degraded': { env: 'VIDEO_CONTEXT_ALLOW_GUEST', type: 'boolean' },
-  'sampling.scene_threshold': { env: 'VIDEO_CONTEXT_SCENE_THRESHOLD', type: 'number' },
+  'sampling.probe_fps': { env: 'VIDEO_CONTEXT_PROBE_FPS', type: 'number' },
+  'sampling.diff_threshold': { env: 'VIDEO_CONTEXT_DIFF_THRESHOLD', type: 'number' },
+  'sampling.settle_threshold': { env: 'VIDEO_CONTEXT_SETTLE_THRESHOLD', type: 'number' },
   'sampling.min_interval_sec': { env: 'VIDEO_CONTEXT_MIN_INTERVAL_SEC', type: 'number' },
   'sampling.max_interval_sec': { env: 'VIDEO_CONTEXT_MAX_INTERVAL_SEC', type: 'number' },
   'sampling.max_frames': { env: 'VIDEO_CONTEXT_MAX_FRAMES', type: 'integer' },
-  'sampling.clip_interval_sec': { env: 'VIDEO_CONTEXT_CLIP_INTERVAL_SEC', type: 'number' },
-  'sampling.clip_max_span_sec': { env: 'VIDEO_CONTEXT_CLIP_MAX_SPAN_SEC', type: 'number' },
   'grid.cols': { env: 'VIDEO_CONTEXT_GRID_COLS', type: 'integer' },
   'grid.rows': { env: 'VIDEO_CONTEXT_GRID_ROWS', type: 'integer' },
   'grid.cell_width': { env: 'VIDEO_CONTEXT_CELL_WIDTH', type: 'integer' },
@@ -106,7 +106,6 @@ export function loadEffectiveConfig() {
   const merged = structuredClone(DEFAULT_CONFIG);
   const activeEnvOverrides = [];
 
-  // 1. Overlay config.yaml values
   for (const dotPath of Object.keys(ENV_VAR_MAP)) {
     const val = getByPath(yamlObj, dotPath);
     if (val !== undefined && val !== null) {
@@ -114,7 +113,6 @@ export function loadEffectiveConfig() {
     }
   }
 
-  // 2. Overlay external Environment Variables
   for (const [dotPath, spec] of Object.entries(ENV_VAR_MAP)) {
     const envRaw = process.env[spec.env];
     if (envRaw !== undefined && envRaw !== '') {
@@ -126,7 +124,6 @@ export function loadEffectiveConfig() {
     }
   }
 
-  // 3. Overlay startup CLI --output-dir if set
   if (runtimeOutputDir) {
     merged.output.dir = runtimeOutputDir;
   }
@@ -167,7 +164,7 @@ export async function saveConfigUpdates(updates = {}) {
 
   await fs.promises.writeFile(cfgPath, doc.toString(), 'utf8');
   if (updates['output.dir']) {
-    runtimeOutputDir = null; // Let updated config.yaml / env take effect cleanly
+    runtimeOutputDir = null;
   }
   return loadEffectiveConfig();
 }
@@ -188,7 +185,7 @@ export function resolveOutputDir(outputDirOverride) {
     return path.resolve(outputDirOverride.trim());
   }
   const { config } = loadEffectiveConfig();
-  return resolvePathFromProject(config.output.dir || './output');
+  return resolvePathFromProject(config.output.dir || DEFAULT_OUTPUT_PATH);
 }
 
 export function getBilibiliCookieConfig() {
