@@ -14,8 +14,8 @@ const SERVER_INSTRUCTIONS = `
 Video Context MCP packages deterministic YouTube and Bilibili video URLs/BV IDs into a local Context Bundle in one call.
 Workflow:
 1. Pass only deterministic URLs, BV IDs, av IDs, or 11-char YouTube Video IDs to video_extract (never fuzzy titles).
-2. Read paths.transcript (if non-null) first: it already contains metadata, chapters, and deduplicated [MM:SS] lines.
-3. Selectively read ONLY the matching grid_xxx.jpg files in paths.grid_files (filenames encode start-end timestamps, and each cell has a zero-occlusion "#FrameNo | Timestamp" top bar). Do NOT read sprites_dir, manifest, or frames_index when high-res grids are available.
+2. Once video_extract returns, read ALL core outputs together (batching parallel read calls as needed): paths.transcript (if non-null), EVERY image in paths.grid_files, and EVERY image in paths.sprite_files.
+3. Do NOT skip or guess-filter any grid or sprite image — always load the complete transcript, all grids, and all sprites so silent visuals, burned-in text, and post-credits scenes are never missed.
 `.trim();
 
 function formatToolResponse(payload) {
@@ -59,17 +59,17 @@ export function createVideoContextMcpServer() {
   const server = new McpServer(
     {
       name: 'video-context-mcp',
-      version: '2.1.0',
+      version: '2.1.1',
     },
     {
       instructions: SERVER_INSTRUCTIONS,
     }
   );
 
-  // Tool 1: video_extract (Unified One-Shot Pipeline with smart defaults)
+  // Tool 1: video_extract (Unified One-Shot Pipeline with smart defaults & 5s progress heartbeats)
   server.tool(
     'video_extract',
-    'One-shot video context extraction with pre-tuned defaults: fetches cleaned transcript, chapters, sprites, and settled 3x3 timestamped visual grids, auto-cleans temporary video cache, and returns concise local file paths.',
+    'One-shot video context extraction (300s timeout + progress heartbeats): fetches cleaned transcript, chapters, sprite sheets, and settled 3x3 timestamped visual grids, auto-cleans temporary video cache, and returns all local file paths to read together.',
     {
       url_or_id: z
         .string()
@@ -90,12 +90,50 @@ export function createVideoContextMcpServer() {
         .default(false)
         .describe('Force re-extraction even if completed bundle already exists in output.'),
     },
-    async (args) => {
+    async (args, extra) => {
+      const progressToken = extra?._meta?.progressToken;
+      let tick = 0;
+      const sendHeartbeat = (message) => {
+        if (progressToken === undefined || typeof extra?.sendNotification !== 'function') return;
+        tick += 1;
+        extra
+          .sendNotification({
+            method: 'notifications/progress',
+            params: {
+              progressToken,
+              progress: Math.min(95, tick * 5),
+              total: 100,
+              message,
+            },
+          })
+          .catch(() => {});
+      };
+
+      sendHeartbeat('Starting video extraction...');
+      const heartbeatTimer =
+        progressToken !== undefined
+          ? setInterval(
+              () => sendHeartbeat('Downloading compact video stream & composing visual grids...'),
+              5_000
+            )
+          : null;
+      if (heartbeatTimer?.unref) heartbeatTimer.unref();
+
       try {
         const res = await extractVideo(args);
+        if (progressToken !== undefined && typeof extra?.sendNotification === 'function') {
+          extra
+            .sendNotification({
+              method: 'notifications/progress',
+              params: { progressToken, progress: 100, total: 100, message: 'Completed' },
+            })
+            .catch(() => {});
+        }
         return formatToolResponse(res);
       } catch (err) {
         return formatToolError(err);
+      } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
       }
     }
   );
@@ -125,6 +163,13 @@ export function createVideoContextMcpServer() {
         .boolean()
         .optional()
         .describe('Keep temporary downloaded video stream in cache/ after grid extraction (default false; env: VIDEO_CONTEXT_KEEP_VIDEO_CACHE).'),
+      timeout_sec: z
+        .number()
+        .int()
+        .min(15)
+        .max(1800)
+        .optional()
+        .describe('Persist execution timeout in seconds (default 300; env: VIDEO_CONTEXT_TIMEOUT_SEC).'),
       bilibili_cookie: z
         .string()
         .optional()

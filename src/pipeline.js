@@ -87,6 +87,7 @@ export async function manageConfig(updates = {}) {
   const keyMap = {
     output_dir: 'output.dir',
     keep_video_cache: 'output.keep_video_cache',
+    timeout_sec: 'runtime.timeout_sec',
     bilibili_cookie: 'auth.bilibili_cookie',
     allow_guest_degraded: 'auth.allow_guest_degraded',
     probe_fps: 'sampling.probe_fps',
@@ -589,16 +590,20 @@ function isBundleComplete(paths) {
 }
 
 /**
- * Return ONLY concise statistics and essential local file paths so MCP responses stay compact
- * and prevent agents from redundantly loading both sprites and high-res grids.
+ * Return concise statistics and all generated file paths (transcript + grid_files + sprite_files)
+ * with an explicit instruction to load them all together without skipping.
  */
 async function buildPathsOnlyReturnPayload(paths) {
   const manifest = JSON.parse(await fs.promises.readFile(paths.manifestPath, 'utf8'));
   const framesIndex = JSON.parse(await fs.promises.readFile(paths.framesIndexPath, 'utf8'));
 
   const hasSubtitle = Boolean(manifest.subtitle_meta?.has_subtitle);
-  const spriteCount = manifest.sprites_meta?.sheet_count || 0;
-  const hasSprites = spriteCount > 0 && fs.existsSync(paths.spritesDir);
+  const spriteFiles = fs.existsSync(paths.spritesDir)
+    ? (await fs.promises.readdir(paths.spritesDir))
+        .filter((f) => /\.(jpg|jpeg|png|webp)$/i.test(f))
+        .sort()
+        .map((f) => path.join(paths.spritesDir, f))
+    : [];
   const gridFiles = (framesIndex.grids || []).map((g) => path.join(paths.bundleDir, g.file));
 
   return {
@@ -613,18 +618,18 @@ async function buildPathsOnlyReturnPayload(paths) {
     has_subtitle: hasSubtitle,
     subtitle_segments: manifest.subtitle_meta?.segment_count || 0,
     chapters: manifest.chapters?.length > 0 ? manifest.chapters : undefined,
+    sprite_sheets: spriteFiles.length,
     total_frames: framesIndex.total_frames,
     total_grids: framesIndex.total_grids,
-    reading_guide: hasSubtitle
-      ? 'Read paths.transcript first (includes chapters & [MM:SS] lines), then selectively read only matching grid_files by timestamp. Skip sprites_dir when grid_files exist.'
-      : 'No subtitle track available; selectively read paths.grid_files by timestamp.',
+    reading_guide:
+      'Read ALL extracted files together without skipping: read paths.transcript (if non-null), ALL images in paths.grid_files, and ALL images in paths.sprite_files so no visual detail, silent segment, or post-credits scene is missed.',
     paths: {
       bundle_dir: paths.bundleDir,
       transcript: hasSubtitle ? paths.transcriptPath : null,
       grid_files: gridFiles,
+      sprite_files: spriteFiles,
       manifest: paths.manifestPath,
       frames_index: paths.framesIndexPath,
-      sprites_dir: hasSprites ? paths.spritesDir : null,
     },
   };
 }

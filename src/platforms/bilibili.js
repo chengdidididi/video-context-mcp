@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { getTimeoutMs } from '../config.js';
 import { parseBilibiliBccJson } from '../parsers/subtitles.js';
 import { mapWithConcurrency } from '../utils/exec.js';
 import { downloadFile, fetchWithContext } from '../utils/http.js';
@@ -407,8 +408,8 @@ async function downloadFromMirrorList(urls, destPath, cookieHeader) {
         await downloadFile(u, partPath, {
           platform: 'bilibili',
           cookieHeader,
-          timeoutMs: 300_000,
-          stallTimeoutMs: 20_000,
+          timeoutMs: getTimeoutMs(),
+          stallTimeoutMs: 30_000,
           headers: reqHeaders,
         });
       }

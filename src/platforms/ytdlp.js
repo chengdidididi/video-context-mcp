@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { resolveBinary } from '../config.js';
+import { getTimeoutMs, resolveBinary } from '../config.js';
 import { parseVttOrSrt, parseYoutubeJson3 } from '../parsers/subtitles.js';
 import { mapWithConcurrency, runCommand } from '../utils/exec.js';
 import { downloadFile, fetchWithContext } from '../utils/http.js';
@@ -34,7 +34,7 @@ export async function dumpYtDlpInfo(platform, canonicalUrl, cookieFilePath) {
     '--dump-single-json',
     canonicalUrl,
   ];
-  const { stdout } = await runCommand(ytdlp, args, { timeoutMs: 90_000 });
+  const { stdout } = await runCommand(ytdlp, args, { timeoutMs: getTimeoutMs() });
   return JSON.parse(stdout);
 }
 
@@ -151,7 +151,7 @@ export async function extractSubtitlesFromYtDlpInfo(info, platform, canonicalUrl
   ];
 
   try {
-    await runCommand(ytdlp, args, { timeoutMs: 60_000 });
+    await runCommand(ytdlp, args, { timeoutMs: getTimeoutMs() });
     const files = await fs.promises.readdir(tempDir);
     const subFile = files.find((f) => f.startsWith('sub_dl.') && /\.(json3|vtt|srt)$/i.test(f));
     if (subFile) {
@@ -427,7 +427,7 @@ export async function ensureCachedVideoStream({
         '-o',
         outTemplate,
       ];
-      await runCommand(ytdlp, fastArgs, { timeoutMs: 240_000 });
+      await runCommand(ytdlp, fastArgs, { timeoutMs: getTimeoutMs() });
       const downloadedFast = await findCompletedFile();
       if (downloadedFast) return downloadedFast;
     } catch (err) {
@@ -449,7 +449,7 @@ export async function ensureCachedVideoStream({
     canonicalUrl,
   ];
 
-  await runCommand(ytdlp, args, { timeoutMs: 300_000 });
+  await runCommand(ytdlp, args, { timeoutMs: getTimeoutMs() });
 
   const downloaded = await findCompletedFile();
   if (!downloaded) {

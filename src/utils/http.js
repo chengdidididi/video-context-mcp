@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { USER_AGENT, REFERERS } from '../config.js';
+import { getTimeoutMs, REFERERS, USER_AGENT } from '../config.js';
 
 /**
  * Parse either Netscape cookies.txt text (preserving #HttpOnly_ entries like Bilibili SESSDATA)
@@ -157,8 +157,8 @@ export async function downloadFile(url, destPath, options = {}) {
     platform,
     cookieHeader,
     headers = {},
-    timeoutMs = 120_000,
-    stallTimeoutMs = 15_000,
+    timeoutMs = getTimeoutMs(),
+    stallTimeoutMs = 30_000,
   } = options;
 
   const finalHeaders = {

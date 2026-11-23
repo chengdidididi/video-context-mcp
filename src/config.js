@@ -25,6 +25,9 @@ export const DEFAULT_CONFIG = {
     dir: DEFAULT_OUTPUT_PATH,
     keep_video_cache: false,
   },
+  runtime: {
+    timeout_sec: 300,
+  },
   auth: {
     bilibili_cookie: '',
     allow_guest_degraded: false,
@@ -59,6 +62,7 @@ export const DEFAULT_CONFIG = {
 export const ENV_VAR_MAP = {
   'output.dir': { env: 'VIDEO_CONTEXT_OUTPUT_DIR', type: 'string' },
   'output.keep_video_cache': { env: 'VIDEO_CONTEXT_KEEP_VIDEO_CACHE', type: 'boolean' },
+  'runtime.timeout_sec': { env: 'VIDEO_CONTEXT_TIMEOUT_SEC', type: 'integer' },
   'auth.bilibili_cookie': { env: 'BILIBILI_COOKIE', type: 'string' },
   'auth.allow_guest_degraded': { env: 'VIDEO_CONTEXT_ALLOW_GUEST', type: 'boolean' },
   'sampling.probe_fps': { env: 'VIDEO_CONTEXT_PROBE_FPS', type: 'number' },
@@ -199,6 +203,12 @@ export function getBilibiliCookieConfig() {
     source: fromEnv ? 'env:BILIBILI_COOKIE' : rawValue ? `yaml:${configFilePath}` : 'none',
     allowGuestDegraded: Boolean(config.auth.allow_guest_degraded),
   };
+}
+
+export function getTimeoutMs() {
+  const { config } = loadEffectiveConfig();
+  const sec = Number(config.runtime?.timeout_sec || 300);
+  return Math.max(15, Number.isFinite(sec) ? sec : 300) * 1000;
 }
 
 export function getGridSpec() {

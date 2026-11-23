@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
-import { getEnhancedEnv, getGridSpec, resolveBinary } from '../config.js';
+import { getEnhancedEnv, getGridSpec, getTimeoutMs, resolveBinary } from '../config.js';
 import { mapWithConcurrency, runCommand } from '../utils/exec.js';
 
 /**
@@ -52,7 +52,7 @@ export function scanSinglePassVideoStream(
     cellHeight,
     probeWidth = 160,
     probeHeight = 90,
-    timeoutMs = 300_000,
+    timeoutMs = getTimeoutMs(),
   } = {}
 ) {
   const ffmpeg = resolveBinary('ffmpeg');
@@ -177,7 +177,7 @@ export function encodeRgbCandidateToJpeg(rgbBuffer, width, height, quality = 88)
 export function scanGrayscaleProbeStream(
   videoPath,
   onFrame,
-  { probeFps = 2.5, width = 160, height = 90, timeoutMs = 300_000 } = {}
+  { probeFps = 2.5, width = 160, height = 90, timeoutMs = getTimeoutMs() } = {}
 ) {
   const ffmpeg = resolveBinary('ffmpeg');
   const frameBytes = width * height;

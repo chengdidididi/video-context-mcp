@@ -7,8 +7,14 @@ const { values } = parseArgs({
   strict: false,
   options: {
     'output-dir': { type: 'string', short: 'o' },
+    version: { type: 'boolean', short: 'v' },
   },
 });
+
+if (values.version) {
+  console.log('2.1.1');
+  process.exit(0);
+}
 
 if (typeof values['output-dir'] === 'string') {
   setRuntimeOutputDir(values['output-dir']);

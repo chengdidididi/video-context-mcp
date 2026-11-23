@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
-import { getEnhancedEnv } from '../config.js';
+import { getEnhancedEnv, getTimeoutMs } from '../config.js';
 
 /**
  * Execute an external binary safely with argument array (never shell interpolation).
  */
 export function runCommand(binary, args = [], options = {}) {
-  const { cwd, timeoutMs = 300_000, env } = options;
+  const { cwd, timeoutMs = getTimeoutMs(), env } = options;
 
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, {

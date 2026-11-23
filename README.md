@@ -93,6 +93,7 @@ magpie library mcp add video-context --local timeout=300 \
 | :--- | :--- | :---: | :--- |
 | `output.dir` | `VIDEO_CONTEXT_OUTPUT_DIR` | `"./output"` | 产物统一输出根目录（`npx` 远程模式默认 `~/video-context-output`） |
 | `output.keep_video_cache` | `VIDEO_CONTEXT_KEEP_VIDEO_CACHE` | `false` | 拼图合成后是否保留 `cache/` 下的临时原视频流（默认 `false` 用完即焚，零原片磁盘残留） |
+| `runtime.timeout_sec` | `VIDEO_CONTEXT_TIMEOUT_SEC` | `300` | 下载与媒体处理的全局单任务超时上限（秒，默认 5 分钟；执行期间每 5s 发送 MCP `notifications/progress` 心跳保活） |
 | `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
 | `auth.allow_guest_degraded` | `VIDEO_CONTEXT_ALLOW_GUEST` | `false` | 未配 B 站 Cookie 时是否允许降级为 360p 无 AI 字幕游客模式 |
 | `sampling.probe_fps` | `VIDEO_CONTEXT_PROBE_FPS` | `2.5` | 内存灰度探针流采样帧率（默认每 `0.4s` 扫描一次） |

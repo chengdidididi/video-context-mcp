@@ -14,4 +14,4 @@
 | [L83-L137](../../src/pipeline.js#L83-L137) | `manageConfig` | 校验并持久化更新 `config.yaml` 中的 19 项参数。 |
 | [L142-L155](../../src/pipeline.js#L142-L155) | `getAuthStatus` | 汇总二进制依赖、当前生效输出路径、环境变量覆盖项与 B 站实时登录态。 |
 | [L173-L545](../../src/pipeline.js#L173-L545) | `extractVideo` & `runExtractVideoInternal` | **一步到位极速主流程**：<br>1. `inFlightExtractions` 防重锁：同一视频并发重试时直接共享执行中的 Promise；<br>2. `Promise.all` 并发拉取字幕（章节合并入 `transcript.md`）、雪碧图与紧凑纯视频流（复用 `ytdlp_info.json` 省去二次解密）；<br>3. 运行单进程多线程 `scanSinglePassVideoStream` 一步完成两道栅栏检测与候选帧内存 JPEG 捕获；<br>4. 并发合成 `grids/`，并在 `finally` 中按 `keep_video_cache`（默认 `false`）自动清理 `cache/` 临时原视频流。 |
-| [L560-L597](../../src/pipeline.js#L560-L597) | `buildPathsOnlyReturnPayload` | **精简防误读返回体**：仅输出关键路径（无字幕时 `transcript: null`；不展开 `sprite_files` 列表避免模型把雪碧图与高清宫格双份重复读取）及一行 `reading_guide`。 |
+| [L595-L635](../../src/pipeline.js#L595-L635) | `buildPathsOnlyReturnPayload` | **全量路径直出**：完整返回 `paths.transcript`、`paths.grid_files`（全部宫格图路径）与 `paths.sprite_files`（全部雪碧图路径），并通过 `reading_guide` 明确指示模型一次性全部读入，杜绝跳图漏检。 |
