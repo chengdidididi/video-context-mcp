@@ -12,10 +12,8 @@ import { AuthRequiredError } from './platforms/auth.js';
 
 const SERVER_INSTRUCTIONS = `
 Video Context MCP packages deterministic YouTube and Bilibili video URLs/BV IDs into a local Context Bundle in one call.
-Workflow:
-1. Pass only deterministic URLs, BV IDs, av IDs, or 11-char YouTube Video IDs to video_extract (never fuzzy titles).
-2. Once video_extract returns, read ALL core outputs together (batching parallel read calls as needed): paths.transcript (if non-null), EVERY image in paths.grid_files, and EVERY image in paths.sprite_files.
-3. Do NOT skip or guess-filter any grid or sprite image — always load the complete transcript, all grids, and all sprites so silent visuals, burned-in text, and post-credits scenes are never missed.
+- Pass only deterministic URLs, BV IDs, av IDs, or 11-char YouTube Video IDs to video_extract (never fuzzy titles).
+- Outputs a unified transcript.md (containing metadata, description, chapters, and cleaned [MM:SS] transcript) and grids/ (Two-Gate settled 3x3 visual grids with zero-occlusion "#FrameNo | Timestamp" top bars), returning their local file paths.
 `.trim();
 
 function formatToolResponse(payload) {
@@ -59,7 +57,7 @@ export function createVideoContextMcpServer() {
   const server = new McpServer(
     {
       name: 'video-context-mcp',
-      version: '2.1.1',
+      version: '2.2.0',
     },
     {
       instructions: SERVER_INSTRUCTIONS,
@@ -69,7 +67,7 @@ export function createVideoContextMcpServer() {
   // Tool 1: video_extract (Unified One-Shot Pipeline with smart defaults & 5s progress heartbeats)
   server.tool(
     'video_extract',
-    'One-shot video context extraction (300s timeout + progress heartbeats): fetches cleaned transcript, chapters, sprite sheets, and settled 3x3 timestamped visual grids, auto-cleans temporary video cache, and returns all local file paths to read together.',
+    'One-shot video context extraction: fetches metadata, chapters, and cleaned transcript into transcript.md, runs single-pass Two-Gate visual sampling to compose 3x3 timestamped grids (8px gutter), auto-cleans temporary video cache, and returns local file paths.',
     {
       url_or_id: z
         .string()
@@ -199,7 +197,7 @@ export function createVideoContextMcpServer() {
   // Tool 4: video_read_image
   server.tool(
     'video_read_image',
-    'Return a single generated grid or sprite image as MCP ImageContent (for clients without direct local image file reading).',
+    'Return a single generated grid image as MCP ImageContent (for clients without direct local image file reading).',
     {
       image_path: z.string().describe('Absolute path to a generated .jpg/.png/.webp file inside output.'),
     },

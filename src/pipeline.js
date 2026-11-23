@@ -26,14 +26,12 @@ import {
 import {
   downloadBilibiliDashStream,
   fetchBilibiliSubtitlesAndChapters,
-  fetchBilibiliVideoshot,
   fetchBilibiliView,
 } from './platforms/bilibili.js';
 import {
   dumpYtDlpInfo,
   ensureCachedVideoStream,
   extractSubtitlesFromYtDlpInfo,
-  extractYoutubeStoryboards,
 } from './platforms/ytdlp.js';
 import { writeTempNetscapeCookieFile } from './utils/http.js';
 import { roundSec } from './utils/time.js';
@@ -46,11 +44,6 @@ function getBundlePaths(baseOutputDir, bundleId) {
     bundleDir,
     manifestPath: path.join(bundleDir, 'manifest.json'),
     transcriptPath: path.join(bundleDir, 'transcript.md'),
-    framesIndexPath: path.join(bundleDir, 'frames_index.json'),
-    subtitlesDir: path.join(bundleDir, 'subtitles'),
-    subtitlesJsonPath: path.join(bundleDir, 'subtitles', 'subtitles.json'),
-    spritesDir: path.join(bundleDir, 'sprites'),
-    spritesIndexPath: path.join(bundleDir, 'sprites', 'sprites_index.json'),
     gridsDir: path.join(bundleDir, 'grids'),
     cacheDir: path.join(bundleDir, 'cache'),
   };
@@ -235,10 +228,10 @@ async function runExtractVideoInternal(
       return buildPathsOnlyReturnPayload(paths);
     }
 
-    await fs.promises.mkdir(paths.subtitlesDir, { recursive: true });
+    await fs.promises.mkdir(paths.bundleDir, { recursive: true });
     await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
-    console.error(`[video-context] Fetching subtitles, sprites & compact stream concurrently for ${bundleId}...`);
+    console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
 
     const fetchSubsTask = (async () => {
       let { chapters, subtitleTrack, segments } = await fetchBilibiliSubtitlesAndChapters(
@@ -274,13 +267,6 @@ async function runExtractVideoInternal(
       return { chapters, subtitleTrack, segments };
     })();
 
-    const fetchSpritesTask = fetchBilibiliVideoshot(
-      view.bvid,
-      view.cid,
-      paths.spritesDir,
-      cookieHeader
-    );
-
     const fetchVideoTask = (async () => {
       try {
         return await downloadBilibiliDashStream({
@@ -307,8 +293,10 @@ async function runExtractVideoInternal(
       }
     })();
 
-    const [{ chapters, subtitleTrack, segments }, spritesRes, downloadedVideoPath] =
-      await Promise.all([fetchSubsTask, fetchSpritesTask, fetchVideoTask]);
+    const [{ chapters, segments }, downloadedVideoPath] = await Promise.all([
+      fetchSubsTask,
+      fetchVideoTask,
+    ]);
     videoPath = downloadedVideoPath;
 
     const transcriptMd = formatTranscriptMarkdown(segments, {
@@ -316,21 +304,17 @@ async function runExtractVideoInternal(
       author: view.author,
       platform: 'bilibili',
       durationSec: view.duration_sec,
+      description: view.description,
       chapters,
       sourceUrl: view.canonicalUrl,
     });
     await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
-    await fs.promises.writeFile(paths.subtitlesJsonPath, JSON.stringify(segments, null, 2), 'utf8');
 
     metaInfo = {
       bundle_id: bundleId,
-      output_root: baseOutputDir,
       platform: 'bilibili',
       video_id: view.bvid,
-      aid: view.aid,
-      cid: view.cid,
       part: view.part,
-      part_explicit: resolved.partExplicit,
       multi_part_notice:
         view.pages.length > 1 && !resolved.partExplicit
           ? `This video has ${view.pages.length} parts. Defaulted to P1 ("${view.partTitle}"). Pass part=N for other parts.`
@@ -339,23 +323,8 @@ async function runExtractVideoInternal(
       title: view.title,
       author: view.author,
       duration_sec: view.duration_sec,
-      description: view.description,
-      chapters,
-      parts: view.pages,
-      auth_degraded: !biliAuth.authenticated,
-      subtitle_meta: {
-        has_subtitle: segments.length > 0,
-        source_type: subtitleTrack?.source_type || null,
-        language: subtitleTrack?.language || null,
-        segment_count: segments.length,
-        transcript_file: 'transcript.md',
-        subtitles_json_file: 'subtitles/subtitles.json',
-      },
-      sprites_meta: {
-        available: spritesRes.available,
-        sheet_count: spritesRes.files.length,
-        index_file: spritesRes.available ? 'sprites/sprites_index.json' : null,
-      },
+      has_subtitle: segments.length > 0,
+      subtitle_segments: segments.length,
       segments,
     };
   } else {
@@ -366,13 +335,13 @@ async function runExtractVideoInternal(
       return buildPathsOnlyReturnPayload(paths);
     }
 
-    await fs.promises.mkdir(paths.subtitlesDir, { recursive: true });
+    await fs.promises.mkdir(paths.bundleDir, { recursive: true });
     await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
     console.error(`[video-context] Resolving YouTube metadata for ${bundleId}...`);
     const info = await dumpYtDlpInfo('youtube', resolved.canonicalUrl, null);
 
-    console.error(`[video-context] Fetching subtitles, storyboards & compact stream concurrently for ${bundleId}...`);
+    console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
     const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
     const fetchSubsTask = extractSubtitlesFromYtDlpInfo(
       info,
@@ -382,7 +351,6 @@ async function runExtractVideoInternal(
       tempSubDir
     ).finally(() => fs.promises.rm(tempSubDir, { recursive: true, force: true }));
 
-    const fetchSpritesTask = extractYoutubeStoryboards(info, paths.spritesDir);
     const fetchVideoTask = ensureCachedVideoStream({
       platform: 'youtube',
       canonicalUrl: resolved.canonicalUrl,
@@ -392,9 +360,8 @@ async function runExtractVideoInternal(
       targetShortSide,
     });
 
-    const [{ subtitleTrack, segments }, spritesRes, downloadedVideoPath] = await Promise.all([
+    const [{ segments }, downloadedVideoPath] = await Promise.all([
       fetchSubsTask,
-      fetchSpritesTask,
       fetchVideoTask,
     ]);
     videoPath = downloadedVideoPath;
@@ -416,38 +383,24 @@ async function runExtractVideoInternal(
       author,
       platform: 'youtube',
       durationSec,
+      description: info.description || '',
       chapters,
       sourceUrl: resolved.canonicalUrl,
     });
     await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
-    await fs.promises.writeFile(paths.subtitlesJsonPath, JSON.stringify(segments, null, 2), 'utf8');
 
     metaInfo = {
       bundle_id: bundleId,
-      output_root: baseOutputDir,
       platform: 'youtube',
       video_id: resolved.videoId,
       part: 1,
+      multi_part_notice: null,
       source_url: resolved.canonicalUrl,
       title,
       author,
       duration_sec: durationSec,
-      description: info.description || '',
-      chapters,
-      parts: [{ part: 1, title, duration_sec: durationSec }],
-      subtitle_meta: {
-        has_subtitle: segments.length > 0,
-        source_type: subtitleTrack?.source_type || null,
-        language: subtitleTrack?.language || null,
-        segment_count: segments.length,
-        transcript_file: 'transcript.md',
-        subtitles_json_file: 'subtitles/subtitles.json',
-      },
-      sprites_meta: {
-        available: spritesRes.available,
-        sheet_count: spritesRes.files.length,
-        index_file: spritesRes.available ? 'sprites/sprites_index.json' : null,
-      },
+      has_subtitle: segments.length > 0,
+      subtitle_segments: segments.length,
       segments,
     };
   }
@@ -554,22 +507,20 @@ async function runExtractVideoInternal(
     }
   }
 
-  await fs.promises.writeFile(paths.framesIndexPath, JSON.stringify(indexPayload, null, 2), 'utf8');
+  // Clean any legacy artifact directories if re-extracting into an existing folder
+  await Promise.all([
+    fs.promises.rm(path.join(paths.bundleDir, 'sprites'), { recursive: true, force: true }),
+    fs.promises.rm(path.join(paths.bundleDir, 'subtitles'), { recursive: true, force: true }),
+    fs.promises.rm(path.join(paths.bundleDir, 'frames_index.json'), { force: true }),
+  ]);
 
   const { segments: _omitSegments, ...manifestBody } = metaInfo;
   const manifest = {
     ...manifestBody,
     duration_sec: roundSec(durationSec, 2),
-    sampling_meta: {
-      probe_fps: effectiveProbeFps,
-      diff_threshold: effectiveDiffThreshold,
-      settle_threshold: effectiveSettleThreshold,
-      max_frames: effectiveMaxFrames,
-      raw_visual_events: rawCandidatesCount,
-      selected_frames: indexPayload.total_frames,
-      total_grids: indexPayload.total_grids,
-      video_cache_retained: keepVideoCache,
-    },
+    total_frames: indexPayload.total_frames,
+    total_grids: indexPayload.total_grids,
+    grid_files: (indexPayload.grids || []).map((g) => g.file),
     completed: true,
   };
 
@@ -578,33 +529,23 @@ async function runExtractVideoInternal(
 }
 
 function isBundleComplete(paths) {
-  if (!fs.existsSync(paths.manifestPath) || !fs.existsSync(paths.framesIndexPath)) {
+  if (!fs.existsSync(paths.manifestPath) || !fs.existsSync(paths.transcriptPath)) {
     return false;
   }
   try {
     const m = JSON.parse(fs.readFileSync(paths.manifestPath, 'utf8'));
-    return Boolean(m?.completed);
+    return Boolean(m?.completed && Array.isArray(m?.grid_files));
   } catch {
     return false;
   }
 }
 
 /**
- * Return concise statistics and all generated file paths (transcript + grid_files + sprite_files)
- * with an explicit instruction to load them all together without skipping.
+ * Return compact video summary and ONLY core output paths (transcript.md + grid_files).
  */
 async function buildPathsOnlyReturnPayload(paths) {
   const manifest = JSON.parse(await fs.promises.readFile(paths.manifestPath, 'utf8'));
-  const framesIndex = JSON.parse(await fs.promises.readFile(paths.framesIndexPath, 'utf8'));
-
-  const hasSubtitle = Boolean(manifest.subtitle_meta?.has_subtitle);
-  const spriteFiles = fs.existsSync(paths.spritesDir)
-    ? (await fs.promises.readdir(paths.spritesDir))
-        .filter((f) => /\.(jpg|jpeg|png|webp)$/i.test(f))
-        .sort()
-        .map((f) => path.join(paths.spritesDir, f))
-    : [];
-  const gridFiles = (framesIndex.grids || []).map((g) => path.join(paths.bundleDir, g.file));
+  const gridFiles = (manifest.grid_files || []).map((rel) => path.join(paths.bundleDir, rel));
 
   return {
     bundle_id: manifest.bundle_id,
@@ -615,21 +556,14 @@ async function buildPathsOnlyReturnPayload(paths) {
     title: manifest.title,
     author: manifest.author,
     duration_sec: manifest.duration_sec,
-    has_subtitle: hasSubtitle,
-    subtitle_segments: manifest.subtitle_meta?.segment_count || 0,
-    chapters: manifest.chapters?.length > 0 ? manifest.chapters : undefined,
-    sprite_sheets: spriteFiles.length,
-    total_frames: framesIndex.total_frames,
-    total_grids: framesIndex.total_grids,
-    reading_guide:
-      'Read ALL extracted files together without skipping: read paths.transcript (if non-null), ALL images in paths.grid_files, and ALL images in paths.sprite_files so no visual detail, silent segment, or post-credits scene is missed.',
+    has_subtitle: Boolean(manifest.has_subtitle),
+    subtitle_segments: manifest.subtitle_segments || 0,
+    total_frames: manifest.total_frames,
+    total_grids: manifest.total_grids,
     paths: {
       bundle_dir: paths.bundleDir,
-      transcript: hasSubtitle ? paths.transcriptPath : null,
+      transcript: paths.transcriptPath,
       grid_files: gridFiles,
-      sprite_files: spriteFiles,
-      manifest: paths.manifestPath,
-      frames_index: paths.framesIndexPath,
     },
   };
 }

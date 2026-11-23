@@ -1,6 +1,6 @@
 # video-context-mcp
 
-将 **YouTube** 与 **Bilibili** 视频（确定性 URL / BV 号 / Video ID）一步解析并打包为多模态大模型（VLM / Agent）友好的本地上下文包（`3×3` 零遮挡顶栏时间戳拼图 + 官方进度条雪碧图 + 二维时间矩阵 JSON + 去重合并时间轴字幕），**MCP 响应仅回传精简统计与已落盘文件路径**，避免大段文本与多轮调用损耗上下文 Token。
+将 **YouTube** 与 **Bilibili** 视频（确定性 URL / BV 号 / Video ID）一步解析并打包为多模态大模型（VLM / Agent）友好的极简本地上下文包（**整合元信息与章节的 `transcript.md` + `3×3` 零遮挡顶栏时间戳拼图 `grids/`**），**MCP 响应仅回传精简统计与这两个核心输出路径**，消除大段文本与冗余索引文件的上下文损耗。
 
 ---
 
@@ -105,7 +105,7 @@ magpie library mcp add video-context --local timeout=300 \
 | `grid.cols` / `grid.rows` | `VIDEO_CONTEXT_GRID_COLS` / `VIDEO_CONTEXT_GRID_ROWS` | `3` / `3` | 网格拼图列数与行数 |
 | `grid.cell_width` / `grid.cell_height` | `VIDEO_CONTEXT_CELL_WIDTH` / `VIDEO_CONTEXT_CELL_HEIGHT` | `640` / `360` | 单格画面内容宽高（px，Lanczos 等比居中补黑边） |
 | `grid.header_height` | `VIDEO_CONTEXT_HEADER_HEIGHT` | `24` | 单格顶部零遮挡纯黑时间戳栏高度（px） |
-| `grid.gutter` / `grid.jpeg_quality` | `VIDEO_CONTEXT_GRID_GUTTER` / `VIDEO_CONTEXT_JPEG_QUALITY` | `2` / `85` | 分隔线宽度（px）与输出 JPEG 质量（`1–100`） |
+| `grid.gutter` / `grid.jpeg_quality` | `VIDEO_CONTEXT_GRID_GUTTER` / `VIDEO_CONTEXT_JPEG_QUALITY` | `8` / `85` | 分隔线宽度（px，默认 `8px` 防止视觉 Patch 跨格串行）与输出 JPEG 质量（`1–100`） |
 | `binaries.yt_dlp` / `ffmpeg` / `ffprobe` | `YTDLP_PATH` / `FFMPEG_PATH` / `FFPROBE_PATH` | `""` | 自定义外部二进制路径（留空自动寻址） |
 
 ---
@@ -113,22 +113,18 @@ magpie library mcp add video-context --local timeout=300 \
 ## 4. 暴露的 MCP 工具与输出结构
 
 ### MCP Tools
-- `video_extract`（**核心一步提取管线**）：面向模型收敛了全部低层调优参数，仅需传入确定性 URL / BV 号即可一步完成：原音/AI 字幕去重合并（含章节头）、官方进度条雪碧图下载、`360p/480p@≤30fps` 轻量纯视频流并发快拉、**单趟多线程 FFmpeg 内存流式扫描（「`8×6` 局部块累积对比 + 动后取静 + 最大帧数优选封顶」）**、`3×3` 零遮挡顶栏时间戳拼图合成，并在落盘后**自动清除临时原视频缓存**；仅回传精简统计与关键文件路径。
+- `video_extract`（**核心一步提取管线**）：面向模型收敛了全部低层调优参数，仅需传入确定性 URL / BV 号即可一步完成：原音/AI 字幕去重合并（顶部自带元信息、简介与章节目录）、`360p/480p@≤30fps` 轻量纯视频流并发快拉、**单趟多线程 FFmpeg 内存流式扫描（「`8×6` 局部块累积对比 + 动后取静 + 最大帧数优选封顶」）**、`3×3` 零遮挡顶栏时间戳拼图合成（`8px` 宽分隔防串格），落盘后**自动清除临时原视频缓存**，仅回传 `transcript` 与 `grid_files` 路径。
 - `video_auth_status`：自检二进制依赖、当前生效输出目录、激活的环境变量覆盖项及 B 站实时登录态。
 - `video_config`：读取当前生效配置，或将常用配置无损持久化写回 `config.yaml`。
-- `video_read_image`：按需单张返回图片的 MCP `ImageContent`（兼容无本地文件读图能力的宿主客户端）。
+- `video_read_image`：按需单张返回网格图的 MCP `ImageContent`（兼容无本地文件读图能力的宿主客户端）。
 
-### 标准 `output` 产物结构
+### 标准 `output` 极简产物结构
 ```text
 output/
 └── <platform>_<video_id>_p<part>/
-    ├── manifest.json            # 视频元信息、章节、分P列表与采样统计
-    ├── transcript.md            # 含元数据、章节目录与去重合并时间轴字幕（AI 首读文件）
-    ├── frames_index.json        # 3x3 拼图二维时间矩阵与每帧触发类型详情
-    ├── subtitles/
-    │   └── subtitles.json       # 毫秒级结构化字幕数组
-    ├── sprites/                 # 平台原生进度条预览雪碧图与时间索引
-    └── grids/                   # 两道栅栏+上限精选的 3x3 零遮挡顶栏时间戳拼图（临时视频流已自动清理）
+    ├── manifest.json            # 轻量完成态缓存清单 (~0.7KB)
+    ├── transcript.md            # 整合标题/作者/时长/简介/章节与去重时间轴字幕的唯一文本文件
+    └── grids/                   # 两道栅栏+上限精选的 3x3 零遮挡顶栏时间戳拼图 (8px 分隔)
 ```
 
 ---

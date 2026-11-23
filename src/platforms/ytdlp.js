@@ -2,9 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getTimeoutMs, resolveBinary } from '../config.js';
 import { parseVttOrSrt, parseYoutubeJson3 } from '../parsers/subtitles.js';
-import { mapWithConcurrency, runCommand } from '../utils/exec.js';
-import { downloadFile, fetchWithContext } from '../utils/http.js';
-import { roundSec } from '../utils/time.js';
+import { runCommand } from '../utils/exec.js';
+import { fetchWithContext } from '../utils/http.js';
 
 function buildBaseYtDlpArgs(platform, cookieFilePath) {
   const args = [
@@ -174,99 +173,6 @@ export async function extractSubtitlesFromYtDlpInfo(info, platform, canonicalUrl
   }
 
   return { subtitleTrack: null, segments: [] };
-}
-
-/**
- * Extract YouTube Storyboard sprite sheets from yt-dlp info.formats and download to sprites/
- */
-export async function extractYoutubeStoryboards(info, spritesDir) {
-  await fs.promises.mkdir(spritesDir, { recursive: true });
-  const formats = Array.isArray(info.formats) ? info.formats : [];
-
-  // Storyboard formats have vcodec === 'none' and acodec === 'none' and fragments + rows/columns (e.g. sb0, sb1, sb2)
-  const sbFormats = formats
-    .filter(
-      (f) =>
-        (String(f.format_id || '').startsWith('sb') || f.ext === 'mhtml') &&
-        Array.isArray(f.fragments) &&
-        f.fragments.length > 0 &&
-        f.rows &&
-        f.columns
-    )
-    .sort((a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0));
-
-  const bestSb = sbFormats[0];
-  if (!bestSb) {
-    return { available: false, files: [], index_path: null };
-  }
-
-  const rows = bestSb.rows;
-  const cols = bestSb.columns;
-  const perSheet = rows * cols;
-  const maxSheets = Math.min(bestSb.fragments.length, 10);
-
-  const fragTasks = [];
-  let cursorSec = 0;
-  for (let i = 0; i < maxSheets; i++) {
-    const frag = bestSb.fragments[i];
-    const fragDuration = Number(frag?.duration || 0);
-    if (frag?.url) {
-      fragTasks.push({ index: i, url: frag.url, startCursorSec: cursorSec, fragDuration });
-    }
-    cursorSec += fragDuration;
-  }
-
-  const results = await mapWithConcurrency(fragTasks, 4, async (task) => {
-    const filename = `sprite_${String(task.index + 1).padStart(2, '0')}.jpg`;
-    const destPath = path.join(spritesDir, filename);
-    try {
-      await downloadFile(task.url, destPath, { platform: 'youtube' });
-      const tileInterval = perSheet > 0 && task.fragDuration > 0 ? task.fragDuration / perSheet : 2.0;
-      const sheetTimes = [];
-      for (let k = 0; k < perSheet; k++) {
-        const t = task.startCursorSec + k * tileInterval;
-        if (info.duration && t > info.duration) break;
-        sheetTimes.push(roundSec(t, 2));
-      }
-      return {
-        destPath,
-        meta: {
-          sheet_index: task.index + 1,
-          file: `sprites/${filename}`,
-          layout: [rows, cols],
-          tile_size: [bestSb.width || 160, bestSb.height || 90],
-          start_sec: sheetTimes[0] ?? roundSec(task.startCursorSec, 2),
-          end_sec: sheetTimes[sheetTimes.length - 1] ?? roundSec(task.startCursorSec + task.fragDuration, 2),
-          timestamps_sec: sheetTimes,
-        },
-      };
-    } catch {
-      return null;
-    }
-  });
-
-  const valid = results.filter(Boolean).sort((a, b) => a.meta.sheet_index - b.meta.sheet_index);
-  const downloadedFiles = valid.map((r) => r.destPath);
-  const sheetsMeta = valid.map((r) => r.meta);
-
-  const indexData = {
-    platform: 'youtube',
-    format_id: bestSb.format_id,
-    available: downloadedFiles.length > 0,
-    layout_per_sheet: [rows, cols],
-    tile_size: [bestSb.width || 160, bestSb.height || 90],
-    sheets: sheetsMeta,
-  };
-
-  const indexPath = path.join(spritesDir, 'sprites_index.json');
-  await fs.promises.writeFile(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
-
-  return {
-    available: downloadedFiles.length > 0,
-    files: downloadedFiles,
-    index_path: indexPath,
-    summary: indexData,
-  };
 }
 
 /**

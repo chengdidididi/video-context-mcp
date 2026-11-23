@@ -130,7 +130,7 @@ export async function composeGrids({
         width: canvasWidth,
         height: canvasHeight,
         channels: 3,
-        background: { r: 31, g: 31, b: 31 },
+        background: { r: 44, g: 44, b: 48 },
       },
     })
       .composite(composites)

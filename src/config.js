@@ -46,7 +46,7 @@ export const DEFAULT_CONFIG = {
     cell_width: 640,
     cell_height: 360,
     header_height: 24,
-    gutter: 2,
+    gutter: 8,
     jpeg_quality: 85,
   },
   binaries: {

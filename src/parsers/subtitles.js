@@ -265,6 +265,17 @@ export function formatTranscriptMarkdown(segments, meta = {}) {
     lines.push('');
   }
 
+  const rawDesc = String(meta.description || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (rawDesc && rawDesc !== '-') {
+    const compactDesc = rawDesc.length > 600 ? `${rawDesc.slice(0, 600).trim()}…` : rawDesc;
+    lines.push('## Description');
+    lines.push(compactDesc);
+    lines.push('');
+  }
+
   if (Array.isArray(meta.chapters) && meta.chapters.length > 0) {
     lines.push('## Chapters');
     for (const ch of meta.chapters) {
@@ -278,13 +289,10 @@ export function formatTranscriptMarkdown(segments, meta = {}) {
     lines.push('');
   }
 
+  lines.push('## Transcript');
   if (!segments || segments.length === 0) {
     lines.push('*(No subtitle track available for this video.)*');
     return lines.join('\n') + '\n';
-  }
-
-  if (Array.isArray(meta.chapters) && meta.chapters.length > 0) {
-    lines.push('## Transcript');
   }
 
   for (const seg of segments) {

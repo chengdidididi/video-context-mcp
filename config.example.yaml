@@ -66,9 +66,9 @@ grid:
   # 环境变量: VIDEO_CONTEXT_HEADER_HEIGHT
   header_height: 24
 
-  # 单元格分隔线宽度（px）与输出 JPEG 质量 (1 - 100)
+  # 单元格分隔线宽度（px，默认 8px 防止视觉 Patch 跨格串行）与输出 JPEG 质量 (1 - 100)
   # 环境变量: VIDEO_CONTEXT_GRID_GUTTER / VIDEO_CONTEXT_JPEG_QUALITY
-  gutter: 2
+  gutter: 8
   jpeg_quality: 85
 
 binaries:
