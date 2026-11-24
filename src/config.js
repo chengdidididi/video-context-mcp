@@ -32,6 +32,48 @@ export const DEFAULT_CONFIG = {
     bilibili_cookie: '',
     allow_guest_degraded: false,
   },
+  asr: {
+    provider: '',
+    language: 'auto',
+    prompt: '',
+    max_duration_sec: 7200,
+    concurrency: 3,
+    request_timeout_sec: 60,
+    max_retries: 2,
+    providers: {
+      siliconflow: {
+        protocol: 'openai-transcriptions',
+        base_url: 'https://api.siliconflow.cn/v1',
+        endpoint_path: '/audio/transcriptions',
+        api_key: '',
+        model: 'FunAudioLLM/SenseVoiceSmall',
+        response_format: '',
+        auth_header: 'Authorization',
+        auth_prefix: 'Bearer ',
+      },
+      mimo: {
+        protocol: 'openai-chat-audio',
+        base_url: 'https://api.xiaomimimo.com/v1',
+        endpoint_path: '/chat/completions',
+        api_key: '',
+        model: 'mimo-v2.5-asr',
+        audio_data_style: 'data_url',
+        user_prompt: '',
+        include_asr_options: true,
+        auth_header: 'Authorization',
+        auth_prefix: 'Bearer ',
+      },
+      cloudflare: {
+        protocol: 'cloudflare',
+        base_url: 'https://api.cloudflare.com/client/v4',
+        account_id: '',
+        api_key: '',
+        model: '@cf/openai/whisper-large-v3-turbo',
+        payload_mode: 'base64_json',
+        vad_filter: true,
+      },
+    },
+  },
   sampling: {
     probe_fps: 2.5,
     diff_threshold: 0.15,
@@ -65,6 +107,43 @@ export const ENV_VAR_MAP = {
   'runtime.timeout_sec': { env: 'VIDEO_CONTEXT_TIMEOUT_SEC', type: 'integer' },
   'auth.bilibili_cookie': { env: 'BILIBILI_COOKIE', type: 'string' },
   'auth.allow_guest_degraded': { env: 'VIDEO_CONTEXT_ALLOW_GUEST', type: 'boolean' },
+
+  'asr.provider': { env: 'VIDEO_CONTEXT_ASR_PROVIDER', type: 'string' },
+  'asr.language': { env: 'VIDEO_CONTEXT_ASR_LANGUAGE', type: 'string' },
+  'asr.prompt': { env: 'VIDEO_CONTEXT_ASR_PROMPT', type: 'string' },
+  'asr.max_duration_sec': { env: 'VIDEO_CONTEXT_ASR_MAX_DURATION_SEC', type: 'integer' },
+  'asr.concurrency': { env: 'VIDEO_CONTEXT_ASR_CONCURRENCY', type: 'integer' },
+  'asr.request_timeout_sec': { env: 'VIDEO_CONTEXT_ASR_REQUEST_TIMEOUT_SEC', type: 'integer' },
+  'asr.max_retries': { env: 'VIDEO_CONTEXT_ASR_MAX_RETRIES', type: 'integer' },
+
+  'asr.providers.siliconflow.protocol': { env: 'SILICONFLOW_PROTOCOL', type: 'string' },
+  'asr.providers.siliconflow.base_url': { env: 'SILICONFLOW_BASE_URL', type: 'string' },
+  'asr.providers.siliconflow.endpoint_path': { env: 'SILICONFLOW_ENDPOINT_PATH', type: 'string' },
+  'asr.providers.siliconflow.api_key': { env: 'SILICONFLOW_API_KEY', type: 'string' },
+  'asr.providers.siliconflow.model': { env: 'SILICONFLOW_MODEL', type: 'string' },
+  'asr.providers.siliconflow.response_format': { env: 'SILICONFLOW_RESPONSE_FORMAT', type: 'string' },
+  'asr.providers.siliconflow.auth_header': { env: 'SILICONFLOW_AUTH_HEADER', type: 'string' },
+  'asr.providers.siliconflow.auth_prefix': { env: 'SILICONFLOW_AUTH_PREFIX', type: 'string' },
+
+  'asr.providers.mimo.protocol': { env: 'MIMO_PROTOCOL', type: 'string' },
+  'asr.providers.mimo.base_url': { env: 'MIMO_BASE_URL', type: 'string' },
+  'asr.providers.mimo.endpoint_path': { env: 'MIMO_ENDPOINT_PATH', type: 'string' },
+  'asr.providers.mimo.api_key': { env: 'MIMO_API_KEY', type: 'string' },
+  'asr.providers.mimo.model': { env: 'MIMO_MODEL', type: 'string' },
+  'asr.providers.mimo.audio_data_style': { env: 'MIMO_AUDIO_DATA_STYLE', type: 'string' },
+  'asr.providers.mimo.user_prompt': { env: 'MIMO_USER_PROMPT', type: 'string' },
+  'asr.providers.mimo.include_asr_options': { env: 'MIMO_INCLUDE_ASR_OPTIONS', type: 'boolean' },
+  'asr.providers.mimo.auth_header': { env: 'MIMO_AUTH_HEADER', type: 'string' },
+  'asr.providers.mimo.auth_prefix': { env: 'MIMO_AUTH_PREFIX', type: 'string' },
+
+  'asr.providers.cloudflare.protocol': { env: 'CLOUDFLARE_PROTOCOL', type: 'string' },
+  'asr.providers.cloudflare.base_url': { env: 'CLOUDFLARE_BASE_URL', type: 'string' },
+  'asr.providers.cloudflare.account_id': { env: 'CLOUDFLARE_ACCOUNT_ID', type: 'string' },
+  'asr.providers.cloudflare.api_key': { env: 'CLOUDFLARE_API_KEY', type: 'string' },
+  'asr.providers.cloudflare.model': { env: 'CLOUDFLARE_MODEL', type: 'string' },
+  'asr.providers.cloudflare.payload_mode': { env: 'CLOUDFLARE_PAYLOAD_MODE', type: 'string' },
+  'asr.providers.cloudflare.vad_filter': { env: 'CLOUDFLARE_VAD_FILTER', type: 'boolean' },
+
   'sampling.probe_fps': { env: 'VIDEO_CONTEXT_PROBE_FPS', type: 'number' },
   'sampling.diff_threshold': { env: 'VIDEO_CONTEXT_DIFF_THRESHOLD', type: 'number' },
   'sampling.settle_threshold': { env: 'VIDEO_CONTEXT_SETTLE_THRESHOLD', type: 'number' },
@@ -106,11 +185,31 @@ function readYamlConfigObject() {
 /**
  * Load merged effective configuration:
  * Precedence: Startup CLI override > Environment Variables > config.yaml > DEFAULT_CONFIG
+ * Also preserves any custom provider slots added under `asr.providers.*` in config.yaml.
  */
 export function loadEffectiveConfig() {
   const yamlObj = readYamlConfigObject();
   const merged = structuredClone(DEFAULT_CONFIG);
   const activeEnvOverrides = [];
+
+  if (yamlObj?.asr?.providers && typeof yamlObj.asr.providers === 'object') {
+    for (const [pName, pVal] of Object.entries(yamlObj.asr.providers)) {
+      if (pVal && typeof pVal === 'object') {
+        merged.asr.providers[pName] = {
+          ...(merged.asr.providers[pName] || {}),
+          ...structuredClone(pVal),
+        };
+      }
+    }
+  }
+
+  // Also preserve optional user-tuned `asr.chunking` or `asr.audio` overrides if placed in config.yaml
+  if (yamlObj?.asr?.chunking && typeof yamlObj.asr.chunking === 'object') {
+    merged.asr.chunking = structuredClone(yamlObj.asr.chunking);
+  }
+  if (yamlObj?.asr?.audio && typeof yamlObj.asr.audio === 'object') {
+    merged.asr.audio = structuredClone(yamlObj.asr.audio);
+  }
 
   for (const dotPath of Object.keys(ENV_VAR_MAP)) {
     const val = getByPath(yamlObj, dotPath);
@@ -161,10 +260,10 @@ export async function saveConfigUpdates(updates = {}) {
   for (const [dotPath, rawVal] of Object.entries(updates)) {
     if (rawVal === undefined) continue;
     const spec = ENV_VAR_MAP[dotPath];
-    if (!spec) {
+    if (!spec && !dotPath.startsWith('asr.providers.')) {
       throw new Error(`Unknown configuration key: "${dotPath}"`);
     }
-    const coerced = coerceValue(rawVal, spec.type);
+    const coerced = spec ? coerceValue(rawVal, spec.type) : rawVal;
     doc.setIn(dotPath.split('.'), coerced);
   }
 
@@ -173,6 +272,23 @@ export async function saveConfigUpdates(updates = {}) {
     runtimeOutputDir = null;
   }
   return loadEffectiveConfig();
+}
+
+export function maskConfigSecrets(config) {
+  const copy = structuredClone(config);
+  if (copy.auth?.bilibili_cookie) {
+    const len = copy.auth.bilibili_cookie.length;
+    copy.auth.bilibili_cookie = `<configured: ${len} chars>`;
+  }
+  if (copy.asr?.providers && typeof copy.asr.providers === 'object') {
+    for (const prov of Object.values(copy.asr.providers)) {
+      if (prov && typeof prov === 'object' && prov.api_key) {
+        const len = String(prov.api_key).length;
+        prov.api_key = `<configured: ${len} chars>`;
+      }
+    }
+  }
+  return copy;
 }
 
 export function setRuntimeOutputDir(dirPath) {

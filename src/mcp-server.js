@@ -3,6 +3,7 @@ import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { AsrConfigRequiredError } from './asr/index.js';
 import {
   extractVideo,
   getAuthStatus,
@@ -11,8 +12,8 @@ import {
 import { AuthRequiredError } from './platforms/auth.js';
 
 const SERVER_INSTRUCTIONS = `
-Video Context MCP packages deterministic YouTube and Bilibili video URLs/BV IDs into a local Context Bundle in one call.
-- Pass only deterministic URLs, BV IDs, av IDs, or 11-char YouTube Video IDs to video_extract (never fuzzy titles).
+Video Context MCP packages deterministic YouTube/Bilibili videos or local video files into a local Context Bundle in one call.
+- Pass only deterministic URLs, BV IDs, av IDs, 11-char YouTube Video IDs, or existing local video file paths to video_extract (never fuzzy titles).
 - Outputs a unified transcript.md (containing metadata, description, chapters, and cleaned [MM:SS] transcript) and grids/ (Two-Gate settled 3x3 visual grids with zero-occlusion "#FrameNo | Timestamp" top bars), returning their local file paths.
 `.trim();
 
@@ -28,19 +29,28 @@ function formatToolResponse(payload) {
 }
 
 function formatToolError(err) {
-  const payload =
-    err instanceof AuthRequiredError
-      ? {
-          error: true,
-          code: err.code,
-          message: err.message,
-          auth_details: err.details,
-        }
-      : {
-          error: true,
-          code: 'EXECUTION_ERROR',
-          message: err?.message || String(err),
-        };
+  let payload;
+  if (err instanceof AuthRequiredError) {
+    payload = {
+      error: true,
+      code: err.code,
+      message: err.message,
+      auth_details: err.details,
+    };
+  } else if (err instanceof AsrConfigRequiredError) {
+    payload = {
+      error: true,
+      code: err.code,
+      message: err.message,
+      asr_details: err.details,
+    };
+  } else {
+    payload = {
+      error: true,
+      code: 'EXECUTION_ERROR',
+      message: err?.message || String(err),
+    };
+  }
 
   return {
     isError: true,
@@ -57,21 +67,23 @@ export function createVideoContextMcpServer() {
   const server = new McpServer(
     {
       name: 'video-context-mcp',
-      version: '2.2.0',
+      version: '2.3.0',
     },
     {
       instructions: SERVER_INSTRUCTIONS,
     }
   );
 
-  // Tool 1: video_extract (Unified One-Shot Pipeline with smart defaults & 5s progress heartbeats)
+  // Tool 1: video_extract (Zero audio/ASR options exposed to AI)
   server.tool(
     'video_extract',
-    'One-shot video context extraction: fetches metadata, chapters, and cleaned transcript into transcript.md, runs single-pass Two-Gate visual sampling to compose 3x3 timestamped grids (8px gutter), auto-cleans temporary video cache, and returns local file paths.',
+    'One-shot video context extraction: accepts a deterministic YouTube/Bilibili URL/ID or a local video file path, writes cleaned transcript into transcript.md, runs single-pass Two-Gate visual sampling to compose 3x3 timestamped grids (8px gutter), auto-cleans temporary cache, and returns local file paths.',
     {
       url_or_id: z
         .string()
-        .describe('Deterministic YouTube/Bilibili URL, BV ID (e.g. BV1xx...), av ID, or 11-char YouTube ID.'),
+        .describe(
+          'Deterministic YouTube/Bilibili URL, BV ID (e.g. BV1xx...), av ID, 11-char YouTube ID, or local video file path.'
+        ),
       part: z
         .number()
         .int()
@@ -111,7 +123,7 @@ export function createVideoContextMcpServer() {
       const heartbeatTimer =
         progressToken !== undefined
           ? setInterval(
-              () => sendHeartbeat('Downloading compact video stream & composing visual grids...'),
+              () => sendHeartbeat('Processing media stream, transcript & visual grids...'),
               5_000
             )
           : null;
@@ -136,10 +148,10 @@ export function createVideoContextMcpServer() {
     }
   );
 
-  // Tool 2: video_auth_status
+  // Tool 2: video_auth_status (Includes redacted read-only ASR readiness line)
   server.tool(
     'video_auth_status',
-    'Check yt-dlp/ffmpeg binary availability, active output directory, active env overrides, and live Bilibili login status.',
+    'Check yt-dlp/ffmpeg binary availability, active output directory, active env overrides, redacted ASR readiness, and live Bilibili login status.',
     {},
     async () => {
       try {
@@ -151,7 +163,7 @@ export function createVideoContextMcpServer() {
     }
   );
 
-  // Tool 3: video_config
+  // Tool 3: video_config (Zero audio/ASR options exposed to AI)
   server.tool(
     'video_config',
     'Read current effective settings (and environment variable mapping) or persist common setting updates into config.yaml.',

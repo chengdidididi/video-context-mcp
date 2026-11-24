@@ -276,6 +276,76 @@ export function selectOptimalYtDlpFormat(info, targetShortSide = 360) {
   return scored[0];
 }
 
+export const AUDIO_FORMAT_SELECTOR = [
+  'ba[abr>=32][abr<=96][protocol^=http]',
+  'ba[abr<=140][protocol^=http]',
+  'ba[protocol^=http]',
+  'ba[abr<=128]',
+  'ba',
+  'b[height<=480]',
+  'b',
+].join('/');
+
+export function selectOptimalYtDlpAudioFormat(info, preferredAudioKbps = 96) {
+  const formats = Array.isArray(info?.formats) ? info.formats : [];
+  const durationSec = Math.max(10, Number(info?.duration || 300));
+  const capKbps = Math.max(48, Number(preferredAudioKbps) || 96);
+
+  const audioFormats = formats.filter(
+    (f) =>
+      f &&
+      f.format_id &&
+      f.acodec &&
+      f.acodec !== 'none' &&
+      !String(f.format_id).startsWith('sb') &&
+      f.ext !== 'mhtml'
+  );
+
+  if (audioFormats.length === 0) return null;
+
+  const scored = audioFormats.map((f) => {
+    const isAudioOnly = !f.vcodec || f.vcodec === 'none';
+    const muxRank = isAudioOnly ? 0 : 1;
+
+    const proto = String(f.protocol || '');
+    const protoRank = /^https?$/i.test(proto) ? 0 : 1;
+
+    const abr = Number(f.abr || f.tbr || 96);
+    let bitrateRank = 2;
+    if (abr >= 36 && abr <= capKbps) bitrateRank = 0;
+    else if (abr > capKbps && abr <= 165) bitrateRank = 1;
+
+    const langPref = Number(f.language_preference ?? 0);
+    const dubPenalty = langPref < 0 ? 1 : 0;
+
+    const rawBytes =
+      Number(f.filesize || f.filesize_approx || 0) || abr * 125 * durationSec;
+
+    return {
+      formatId: String(f.format_id),
+      abr,
+      ext: f.ext || 'm4a',
+      proto,
+      rawBytes,
+      muxRank,
+      dubPenalty,
+      protoRank,
+      bitrateRank,
+    };
+  });
+
+  scored.sort(
+    (a, b) =>
+      a.muxRank - b.muxRank ||
+      a.dubPenalty - b.dubPenalty ||
+      a.protoRank - b.protoRank ||
+      a.bitrateRank - b.bitrateRank ||
+      a.rawBytes - b.rawBytes
+  );
+
+  return scored[0];
+}
+
 /**
  * Download compact pure video stream into cache/ (reuses existing cached file or pre-fetched info JSON).
  */
@@ -287,8 +357,56 @@ export async function ensureCachedVideoStream({
   info = null,
   targetShortSide = 360,
 }) {
+  return downloadYtDlpStreamWithPrefix({
+    prefix: 'source_video',
+    platform,
+    canonicalUrl,
+    cacheDir,
+    cookieFilePath,
+    info,
+    picked: info ? selectOptimalYtDlpFormat(info, targetShortSide) : null,
+    fallbackSelector: VIDEO_FORMAT_SELECTOR,
+  });
+}
+
+/**
+ * Download compact audio-only stream into cache/ ONLY when needed for ASR fallback.
+ */
+export async function ensureCachedAudioStream({
+  platform,
+  canonicalUrl,
+  cacheDir,
+  cookieFilePath,
+  info = null,
+  preferredAudioKbps = 96,
+}) {
+  if (info && Array.isArray(info.formats)) {
+    const hasAnyAudio = info.formats.some((f) => f && f.acodec && f.acodec !== 'none');
+    if (!hasAnyAudio) return null;
+  }
+  return downloadYtDlpStreamWithPrefix({
+    prefix: 'source_audio',
+    platform,
+    canonicalUrl,
+    cacheDir,
+    cookieFilePath,
+    info,
+    picked: info ? selectOptimalYtDlpAudioFormat(info, preferredAudioKbps) : null,
+    fallbackSelector: AUDIO_FORMAT_SELECTOR,
+  });
+}
+
+async function downloadYtDlpStreamWithPrefix({
+  prefix,
+  platform,
+  canonicalUrl,
+  cacheDir,
+  cookieFilePath,
+  info,
+  picked,
+  fallbackSelector,
+}) {
   await fs.promises.mkdir(cacheDir, { recursive: true });
-  const prefix = 'source_video';
 
   const findCompletedFile = async () => {
     const files = await fs.promises.readdir(cacheDir);
@@ -306,21 +424,19 @@ export async function ensureCachedVideoStream({
 
   const ytdlp = resolveBinary('yt-dlp');
   const outTemplate = path.join(cacheDir, `${prefix}.%(ext)s`);
-  const picked = info ? selectOptimalYtDlpFormat(info, targetShortSide) : null;
-  const formatArg = picked ? `${picked.formatId}/${VIDEO_FORMAT_SELECTOR}` : VIDEO_FORMAT_SELECTOR;
+  const formatArg = picked ? `${picked.formatId}/${fallbackSelector}` : fallbackSelector;
 
   if (picked) {
     const mb = picked.rawBytes ? `${(picked.rawBytes / 1048576).toFixed(1)}MB` : 'est';
     console.error(
-      `[video-context] Selected format ${picked.formatId} (${picked.shortSide}p${picked.fps ? `@${picked.fps}fps` : ''}, ${picked.proto}, ~${mb})`
+      `[video-context] Selected ${prefix} format ${picked.formatId} (${picked.proto}, ~${mb})`
     );
   }
 
   const speedArgs = ['--concurrent-fragments', '4', '--http-chunk-size', '10M'];
 
-  // Fast path: reuse already-dumped info JSON to skip duplicate webpage + Deno JS challenge solve (~7s saved)
   if (info && info.id) {
-    const infoJsonPath = path.join(cacheDir, 'ytdlp_info.json');
+    const infoJsonPath = path.join(cacheDir, `ytdlp_info_${prefix}.json`);
     try {
       await fs.promises.writeFile(infoJsonPath, JSON.stringify(info), 'utf8');
       const fastArgs = [
@@ -329,7 +445,7 @@ export async function ensureCachedVideoStream({
         '--load-info-json',
         infoJsonPath,
         '-f',
-        picked ? picked.formatId : VIDEO_FORMAT_SELECTOR,
+        picked ? picked.formatId : fallbackSelector,
         '-o',
         outTemplate,
       ];
@@ -359,7 +475,7 @@ export async function ensureCachedVideoStream({
 
   const downloaded = await findCompletedFile();
   if (!downloaded) {
-    throw new Error(`yt-dlp completed without producing video file in ${cacheDir}`);
+    throw new Error(`yt-dlp completed without producing ${prefix} file in ${cacheDir}`);
   }
   return downloaded;
 }

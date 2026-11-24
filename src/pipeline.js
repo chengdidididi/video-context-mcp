@@ -1,9 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { probeAudioStream } from './asr/audio-chunker.js';
+import {
+  getAsrStatusSummary,
+  requireValidAsrProvider,
+  transcribeAudioMedia,
+} from './asr/index.js';
 import {
   ENV_VAR_MAP,
   getBilibiliCookieConfig,
   loadEffectiveConfig,
+  maskConfigSecrets,
   resolveOutputDir,
   resolvePathFromProject,
   saveConfigUpdates,
@@ -13,6 +20,7 @@ import {
   extractLanczosFrames,
   probeVideo,
   scanSinglePassVideoStream,
+  transcodeLocalVideoToCompactCache,
 } from './media/ffmpeg.js';
 import { composeGrids } from './media/grid-composer.js';
 import { createTwoGateTracker, finalizeSamplePlan } from './media/sampler.js';
@@ -24,12 +32,14 @@ import {
   ensureBilibiliAuth,
 } from './platforms/auth.js';
 import {
+  downloadBilibiliDashAudio,
   downloadBilibiliDashStream,
   fetchBilibiliSubtitlesAndChapters,
   fetchBilibiliView,
 } from './platforms/bilibili.js';
 import {
   dumpYtDlpInfo,
+  ensureCachedAudioStream,
   ensureCachedVideoStream,
   extractSubtitlesFromYtDlpInfo,
 } from './platforms/ytdlp.js';
@@ -47,15 +57,6 @@ function getBundlePaths(baseOutputDir, bundleId) {
     gridsDir: path.join(bundleDir, 'grids'),
     cacheDir: path.join(bundleDir, 'cache'),
   };
-}
-
-function maskConfigSecrets(config) {
-  const copy = structuredClone(config);
-  if (copy.auth?.bilibili_cookie) {
-    const len = copy.auth.bilibili_cookie.length;
-    copy.auth.bilibili_cookie = `<configured: ${len} chars>`;
-  }
-  return copy;
 }
 
 async function withTempBilibiliCookieFile(cacheDir, fn) {
@@ -76,7 +77,7 @@ async function withTempBilibiliCookieFile(cacheDir, fn) {
 /**
  * Read or persist unified settings in config.yaml (with 1-to-1 Environment Variable mapping).
  */
-export async function manageConfig(updates = {}) {
+export async function manageConfig(updates = {}, extraDotUpdates = {}) {
   const keyMap = {
     output_dir: 'output.dir',
     keep_video_cache: 'output.keep_video_cache',
@@ -107,6 +108,11 @@ export async function manageConfig(updates = {}) {
       dotUpdates[dotPath] = updates[argKey];
     }
   }
+  for (const [dotPath, val] of Object.entries(extraDotUpdates)) {
+    if (val !== undefined) {
+      dotUpdates[dotPath] = val;
+    }
+  }
 
   if (dotUpdates['output.dir']) {
     const resolvedOut = resolvePathFromProject(String(dotUpdates['output.dir']).trim());
@@ -135,7 +141,7 @@ export async function manageConfig(updates = {}) {
 }
 
 /**
- * Environment, Config & Bilibili Authentication Status Check
+ * Environment, Config, Redacted ASR Readiness & Bilibili Authentication Status Check
  */
 export async function getAuthStatus() {
   const binaries = await checkSystemBinaries();
@@ -148,22 +154,20 @@ export async function getAuthStatus() {
     config_file: state.configFilePath,
     active_output_dir: resolveOutputDir(),
     active_env_overrides: state.activeEnvOverrides,
+    asr: getAsrStatusSummary(state.config.asr),
     bilibili: publicBiliAuth,
   };
 }
 
 /**
  * Unified One-Shot Video Context Pipeline:
- *  1. Resolve deterministic input & verify Bilibili auth (preventing silent 360p/no-subtitle degradation)
- *  2. Fetch metadata, chapters, deduplicated transcript.md, and native progress-bar sprite sheets (sprites/)
- *  3. Cache 480p/720p pure video stream in output/<bundle_id>/cache/
- *  4. Run Two-Gate + Cap visual sampling:
- *     - 0.4s 160x90 grayscale rawvideo memory probe
- *     - Gate 1: 8x6 localized patch cumulative diff against last emitted frame
- *     - Gate 2: Change-then-Settle motion detector
- *     - Cap: Importance * Temporal-Spacing pruning to max_frames
- *  5. Extract Lanczos 640x360 frames & compose zero-occlusion timestamped 3x3 grids (grids/ + frames_index.json)
- *  6. Return ONLY compact summary stats and absolute file paths (zero inline text bloat).
+ *  1. Resolve deterministic input (Bilibili / YouTube / Local video file)
+ *  2. Obtain compact video stream (online download or FFmpeg 360p@<=30fps transcode for local files) + native subtitles
+ *  3. ONLY when native subtitles are absent (or input is a local video with an audio track):
+ *     strictly validate `asr.provider` in config.yaml, extract/fetch compact audio stream, and run adaptive-chunked cloud ASR
+ *  4. Run Two-Gate + Cap visual sampling (leveraging native or ASR subtitle segments for synergy scoring)
+ *  5. Compose zero-occlusion timestamped 3x3 grids (grids/) & auto-clean temporary cache/
+ *  6. Return ONLY compact summary stats and absolute file paths.
  */
 export async function extractVideo(options = {}) {
   const { url_or_id, part, output_dir, force = false } = options;
@@ -189,7 +193,6 @@ export async function extractVideo(options = {}) {
 
 async function runExtractVideoInternal(
   {
-    part,
     probe_fps,
     diff_threshold,
     settle_threshold,
@@ -216,203 +219,342 @@ async function runExtractVideoInternal(
   let paths;
   let metaInfo;
   let videoPath;
+  let indexPayload;
 
-  if (resolved.platform === 'bilibili') {
-    const biliAuth = await ensureBilibiliAuth(allow_guest_degraded);
-    const cookieHeader = biliAuth.cookie_header || '';
-    const view = await fetchBilibiliView(resolved, cookieHeader, biliAuth.wbi_keys);
-    bundleId = `bilibili_${view.bvid}_p${view.part}`;
+  // Pre-flight fast path before creating cache directories
+  if (resolved.platform === 'local') {
+    bundleId = `local_${resolved.videoId}`;
     paths = getBundlePaths(baseOutputDir, bundleId);
-
     if (!force && isBundleComplete(paths)) {
       return buildPathsOnlyReturnPayload(paths);
     }
-
-    await fs.promises.mkdir(paths.bundleDir, { recursive: true });
-    await fs.promises.mkdir(paths.cacheDir, { recursive: true });
-
-    console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
-
-    const fetchSubsTask = (async () => {
-      let { chapters, subtitleTrack, segments } = await fetchBilibiliSubtitlesAndChapters(
-        view.bvid,
-        view.cid,
-        cookieHeader,
-        biliAuth.wbi_keys
-      );
-
-      if (segments.length === 0) {
-        const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
-        try {
-          await withTempBilibiliCookieFile(paths.cacheDir, async (tmpCookiePath) => {
-            const info = await dumpYtDlpInfo('bilibili', view.canonicalUrl, tmpCookiePath);
-            const ytSub = await extractSubtitlesFromYtDlpInfo(
-              info,
-              'bilibili',
-              view.canonicalUrl,
-              tmpCookiePath,
-              tempSubDir
-            );
-            if (ytSub.segments.length > 0) {
-              subtitleTrack = ytSub.subtitleTrack;
-              segments = ytSub.segments;
-            }
-          });
-        } catch {
-          // ignore fallback error
-        } finally {
-          await fs.promises.rm(tempSubDir, { recursive: true, force: true });
-        }
-      }
-      return { chapters, subtitleTrack, segments };
-    })();
-
-    const fetchVideoTask = (async () => {
-      try {
-        return await downloadBilibiliDashStream({
-          bvid: view.bvid,
-          cid: view.cid,
-          destDir: paths.cacheDir,
-          cookieHeader,
-          wbiKeys: biliAuth.wbi_keys,
-          targetShortSide,
-        });
-      } catch (err) {
-        console.error(
-          `[video-context] Direct DASH mirror failed (${err.message}); falling back to yt-dlp...`
-        );
-        return withTempBilibiliCookieFile(paths.cacheDir, (tmpCookiePath) =>
-          ensureCachedVideoStream({
-            platform: 'bilibili',
-            canonicalUrl: view.canonicalUrl,
-            cacheDir: paths.cacheDir,
-            cookieFilePath: tmpCookiePath,
-            targetShortSide,
-          })
-        );
-      }
-    })();
-
-    const [{ chapters, segments }, downloadedVideoPath] = await Promise.all([
-      fetchSubsTask,
-      fetchVideoTask,
-    ]);
-    videoPath = downloadedVideoPath;
-
-    const transcriptMd = formatTranscriptMarkdown(segments, {
-      title: view.title,
-      author: view.author,
-      platform: 'bilibili',
-      durationSec: view.duration_sec,
-      description: view.description,
-      chapters,
-      sourceUrl: view.canonicalUrl,
-    });
-    await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
-
-    metaInfo = {
-      bundle_id: bundleId,
-      platform: 'bilibili',
-      video_id: view.bvid,
-      part: view.part,
-      multi_part_notice:
-        view.pages.length > 1 && !resolved.partExplicit
-          ? `This video has ${view.pages.length} parts. Defaulted to P1 ("${view.partTitle}"). Pass part=N for other parts.`
-          : null,
-      source_url: view.canonicalUrl,
-      title: view.title,
-      author: view.author,
-      duration_sec: view.duration_sec,
-      has_subtitle: segments.length > 0,
-      subtitle_segments: segments.length,
-      segments,
-    };
-  } else {
+  } else if (resolved.platform === 'youtube') {
     bundleId = `youtube_${resolved.videoId}_p1`;
     paths = getBundlePaths(baseOutputDir, bundleId);
-
     if (!force && isBundleComplete(paths)) {
       return buildPathsOnlyReturnPayload(paths);
     }
-
-    await fs.promises.mkdir(paths.bundleDir, { recursive: true });
-    await fs.promises.mkdir(paths.cacheDir, { recursive: true });
-
-    console.error(`[video-context] Resolving YouTube metadata for ${bundleId}...`);
-    const info = await dumpYtDlpInfo('youtube', resolved.canonicalUrl, null);
-
-    console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
-    const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
-    const fetchSubsTask = extractSubtitlesFromYtDlpInfo(
-      info,
-      'youtube',
-      resolved.canonicalUrl,
-      null,
-      tempSubDir
-    ).finally(() => fs.promises.rm(tempSubDir, { recursive: true, force: true }));
-
-    const fetchVideoTask = ensureCachedVideoStream({
-      platform: 'youtube',
-      canonicalUrl: resolved.canonicalUrl,
-      cacheDir: paths.cacheDir,
-      cookieFilePath: null,
-      info,
-      targetShortSide,
-    });
-
-    const [{ segments }, downloadedVideoPath] = await Promise.all([
-      fetchSubsTask,
-      fetchVideoTask,
-    ]);
-    videoPath = downloadedVideoPath;
-
-    const chapters = Array.isArray(info.chapters)
-      ? info.chapters.map((ch) => ({
-          title: ch.title || '',
-          start_sec: roundSec(Number(ch.start_time || 0), 2),
-          end_sec: roundSec(Number(ch.end_time || 0), 2),
-        }))
-      : [];
-
-    const title = info.title || resolved.videoId;
-    const author = info.uploader || info.channel || 'Unknown';
-    const durationSec = Number(info.duration || 0);
-
-    const transcriptMd = formatTranscriptMarkdown(segments, {
-      title,
-      author,
-      platform: 'youtube',
-      durationSec,
-      description: info.description || '',
-      chapters,
-      sourceUrl: resolved.canonicalUrl,
-    });
-    await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
-
-    metaInfo = {
-      bundle_id: bundleId,
-      platform: 'youtube',
-      video_id: resolved.videoId,
-      part: 1,
-      multi_part_notice: null,
-      source_url: resolved.canonicalUrl,
-      title,
-      author,
-      duration_sec: durationSec,
-      has_subtitle: segments.length > 0,
-      subtitle_segments: segments.length,
-      segments,
-    };
   }
 
-  // Step 2: Single-pass multi-threaded FFmpeg stream (Two-Gate + Cap + in-memory JPEG capture)
-  let indexPayload;
-  let rawCandidatesCount = 0;
-  let durationSec = metaInfo.duration_sec || 10;
-
   try {
+    if (resolved.platform === 'local') {
+      const localProbe = await probeVideo(resolved.localPath);
+      if (!localProbe.hasVideo) {
+        throw new Error(`Local file does not contain a valid video stream: "${resolved.localPath}"`);
+      }
+
+      // Fast-fail config check before spending CPU transcoding if local video has an audio track
+      const resolvedProvider = localProbe.hasAudio ? requireValidAsrProvider(config.asr) : null;
+
+      await fs.promises.mkdir(paths.bundleDir, { recursive: true });
+      await fs.promises.mkdir(paths.cacheDir, { recursive: true });
+
+      console.error(
+        `[video-context] Compressing local video (${localProbe.width}x${localProbe.height}${localProbe.fps ? `@${Math.round(localProbe.fps)}fps` : ''}) to 360p@<=30fps cache stream for ${bundleId}...`
+      );
+      videoPath = await transcodeLocalVideoToCompactCache(resolved.localPath, paths.cacheDir, {
+        targetShortSide: 360,
+        maxFps: 30,
+      });
+
+      // Step 1b: Audio ASR processing after video stream is prepared (skipped automatically if local file has no audio track)
+      let segments = [];
+      let subtitleSource = 'none';
+      if (localProbe.hasAudio && resolvedProvider) {
+        const asrOut = await transcribeAudioMedia({
+          audioMediaPath: resolved.localPath,
+          cacheDir: paths.cacheDir,
+          asrConfig: config.asr,
+          resolvedProvider,
+        });
+        segments = asrOut.segments;
+        subtitleSource = `asr:${asrOut.providerName}`;
+      } else {
+        console.error(`[video-context] Local video has no audio stream; skipping ASR.`);
+      }
+
+      const transcriptMd = formatTranscriptMarkdown(segments, {
+        title: resolved.fileName,
+        author: 'Local Video',
+        platform: 'local',
+        durationSec: localProbe.durationSec,
+        sourceUrl: resolved.canonicalUrl,
+      });
+      await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
+
+      metaInfo = {
+        bundle_id: bundleId,
+        platform: 'local',
+        video_id: resolved.videoId,
+        part: 1,
+        multi_part_notice: null,
+        source_url: resolved.canonicalUrl,
+        title: resolved.fileName,
+        author: 'Local Video',
+        duration_sec: localProbe.durationSec,
+        has_subtitle: segments.length > 0,
+        subtitle_source: subtitleSource,
+        subtitle_segments: segments.length,
+        segments,
+      };
+    } else if (resolved.platform === 'bilibili') {
+      const biliAuth = await ensureBilibiliAuth(allow_guest_degraded);
+      const cookieHeader = biliAuth.cookie_header || '';
+      const view = await fetchBilibiliView(resolved, cookieHeader, biliAuth.wbi_keys);
+      bundleId = `bilibili_${view.bvid}_p${view.part}`;
+      paths = getBundlePaths(baseOutputDir, bundleId);
+
+      if (!force && isBundleComplete(paths)) {
+        return buildPathsOnlyReturnPayload(paths);
+      }
+
+      await fs.promises.mkdir(paths.bundleDir, { recursive: true });
+      await fs.promises.mkdir(paths.cacheDir, { recursive: true });
+
+      console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
+
+      const fetchSubsTask = (async () => {
+        let { chapters, subtitleTrack, segments } = await fetchBilibiliSubtitlesAndChapters(
+          view.bvid,
+          view.cid,
+          cookieHeader,
+          biliAuth.wbi_keys
+        );
+
+        if (segments.length === 0) {
+          const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
+          try {
+            await withTempBilibiliCookieFile(paths.cacheDir, async (tmpCookiePath) => {
+              const info = await dumpYtDlpInfo('bilibili', view.canonicalUrl, tmpCookiePath);
+              const ytSub = await extractSubtitlesFromYtDlpInfo(
+                info,
+                'bilibili',
+                view.canonicalUrl,
+                tmpCookiePath,
+                tempSubDir
+              );
+              if (ytSub.segments.length > 0) {
+                subtitleTrack = ytSub.subtitleTrack;
+                segments = ytSub.segments;
+              }
+            });
+          } catch {
+            // ignore fallback error
+          } finally {
+            await fs.promises.rm(tempSubDir, { recursive: true, force: true });
+          }
+        }
+        return { chapters, subtitleTrack, segments };
+      })();
+
+      const fetchVideoTask = (async () => {
+        try {
+          return await downloadBilibiliDashStream({
+            bvid: view.bvid,
+            cid: view.cid,
+            destDir: paths.cacheDir,
+            cookieHeader,
+            wbiKeys: biliAuth.wbi_keys,
+            targetShortSide,
+          });
+        } catch (err) {
+          console.error(
+            `[video-context] Direct DASH mirror failed (${err.message}); falling back to yt-dlp...`
+          );
+          return withTempBilibiliCookieFile(paths.cacheDir, (tmpCookiePath) =>
+            ensureCachedVideoStream({
+              platform: 'bilibili',
+              canonicalUrl: view.canonicalUrl,
+              cacheDir: paths.cacheDir,
+              cookieFilePath: tmpCookiePath,
+              targetShortSide,
+            })
+          );
+        }
+      })();
+
+      let [{ chapters, subtitleTrack, segments }, downloadedVideoPath] = await Promise.all([
+        fetchSubsTask,
+        fetchVideoTask,
+      ]);
+      videoPath = downloadedVideoPath;
+      let subtitleSource = subtitleTrack?.source_type || (segments.length > 0 ? 'native' : 'none');
+
+      // Step 1b: ONLY when native/AI subtitles are absent after video stream is downloaded -> run audio ASR
+      if (segments.length === 0) {
+        let audioPath = null;
+        try {
+          audioPath = await downloadBilibiliDashAudio({
+            bvid: view.bvid,
+            cid: view.cid,
+            destDir: paths.cacheDir,
+            cookieHeader,
+            wbiKeys: biliAuth.wbi_keys,
+            preferredAudioKbps: 96,
+          });
+        } catch (err) {
+          console.error(
+            `[video-context] Direct DASH audio mirror failed (${err.message}); falling back to yt-dlp...`
+          );
+          audioPath = await withTempBilibiliCookieFile(paths.cacheDir, (tmpCookiePath) =>
+            ensureCachedAudioStream({
+              platform: 'bilibili',
+              canonicalUrl: view.canonicalUrl,
+              cacheDir: paths.cacheDir,
+              cookieFilePath: tmpCookiePath,
+              preferredAudioKbps: 96,
+            })
+          );
+        }
+
+        if (audioPath && (await probeAudioStream(audioPath))) {
+          const resolvedProvider = requireValidAsrProvider(config.asr);
+          const asrOut = await transcribeAudioMedia({
+            audioMediaPath: audioPath,
+            cacheDir: paths.cacheDir,
+            asrConfig: config.asr,
+            resolvedProvider,
+          });
+          segments = asrOut.segments;
+          subtitleSource = `asr:${asrOut.providerName}`;
+        }
+      }
+
+      const transcriptMd = formatTranscriptMarkdown(segments, {
+        title: view.title,
+        author: view.author,
+        platform: 'bilibili',
+        durationSec: view.duration_sec,
+        description: view.description,
+        chapters,
+        sourceUrl: view.canonicalUrl,
+      });
+      await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
+
+      metaInfo = {
+        bundle_id: bundleId,
+        platform: 'bilibili',
+        video_id: view.bvid,
+        part: view.part,
+        multi_part_notice:
+          view.pages.length > 1 && !resolved.partExplicit
+            ? `This video has ${view.pages.length} parts. Defaulted to P1 ("${view.partTitle}"). Pass part=N for other parts.`
+            : null,
+        source_url: view.canonicalUrl,
+        title: view.title,
+        author: view.author,
+        duration_sec: view.duration_sec,
+        has_subtitle: segments.length > 0,
+        subtitle_source: subtitleSource,
+        subtitle_segments: segments.length,
+        segments,
+      };
+    } else {
+      await fs.promises.mkdir(paths.bundleDir, { recursive: true });
+      await fs.promises.mkdir(paths.cacheDir, { recursive: true });
+
+      console.error(`[video-context] Resolving YouTube metadata for ${bundleId}...`);
+      const info = await dumpYtDlpInfo('youtube', resolved.canonicalUrl, null);
+
+      console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
+      const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
+      const fetchSubsTask = extractSubtitlesFromYtDlpInfo(
+        info,
+        'youtube',
+        resolved.canonicalUrl,
+        null,
+        tempSubDir
+      ).finally(() => fs.promises.rm(tempSubDir, { recursive: true, force: true }));
+
+      const fetchVideoTask = ensureCachedVideoStream({
+        platform: 'youtube',
+        canonicalUrl: resolved.canonicalUrl,
+        cacheDir: paths.cacheDir,
+        cookieFilePath: null,
+        info,
+        targetShortSide,
+      });
+
+      let [{ subtitleTrack, segments }, downloadedVideoPath] = await Promise.all([
+        fetchSubsTask,
+        fetchVideoTask,
+      ]);
+      videoPath = downloadedVideoPath;
+      let subtitleSource = subtitleTrack?.source_type || (segments.length > 0 ? 'native' : 'none');
+
+      // Step 1b: ONLY when YouTube subtitles are absent after video stream is downloaded -> run audio ASR
+      if (segments.length === 0) {
+        const hasAudioInFormats =
+          !Array.isArray(info.formats) ||
+          info.formats.some((f) => f && f.acodec && f.acodec !== 'none');
+
+        if (hasAudioInFormats) {
+          const resolvedProvider = requireValidAsrProvider(config.asr);
+          const audioPath = await ensureCachedAudioStream({
+            platform: 'youtube',
+            canonicalUrl: resolved.canonicalUrl,
+            cacheDir: paths.cacheDir,
+            cookieFilePath: null,
+            info,
+            preferredAudioKbps: 96,
+          });
+          if (audioPath && (await probeAudioStream(audioPath))) {
+            const asrOut = await transcribeAudioMedia({
+              audioMediaPath: audioPath,
+              cacheDir: paths.cacheDir,
+              asrConfig: config.asr,
+              resolvedProvider,
+            });
+            segments = asrOut.segments;
+            subtitleSource = `asr:${asrOut.providerName}`;
+          }
+        }
+      }
+
+      const chapters = Array.isArray(info.chapters)
+        ? info.chapters.map((ch) => ({
+            title: ch.title || '',
+            start_sec: roundSec(Number(ch.start_time || 0), 2),
+            end_sec: roundSec(Number(ch.end_time || 0), 2),
+          }))
+        : [];
+
+      const title = info.title || resolved.videoId;
+      const author = info.uploader || info.channel || 'Unknown';
+      const durationSec = Number(info.duration || 0);
+
+      const transcriptMd = formatTranscriptMarkdown(segments, {
+        title,
+        author,
+        platform: 'youtube',
+        durationSec,
+        description: info.description || '',
+        chapters,
+        sourceUrl: resolved.canonicalUrl,
+      });
+      await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
+
+      metaInfo = {
+        bundle_id: bundleId,
+        platform: 'youtube',
+        video_id: resolved.videoId,
+        part: 1,
+        multi_part_notice: null,
+        source_url: resolved.canonicalUrl,
+        title,
+        author,
+        duration_sec: durationSec,
+        has_subtitle: segments.length > 0,
+        subtitle_source: subtitleSource,
+        subtitle_segments: segments.length,
+        segments,
+      };
+    }
+
+    // Step 2: Single-pass multi-threaded FFmpeg stream (Two-Gate + Cap + in-memory JPEG capture)
     const probe = await probeVideo(videoPath);
-    durationSec = probe.durationSec || durationSec;
+    const durationSec = probe.durationSec || metaInfo.duration_sec || 10;
+    metaInfo.duration_sec = durationSec;
     const cellW = config.grid.cell_width || 640;
     const cellH = config.grid.cell_height || 360;
 
@@ -439,7 +581,7 @@ async function runExtractVideoInternal(
     });
 
     const rawCandidates = tracker.flush();
-    rawCandidatesCount = rawCandidates.length;
+    const rawCandidatesCount = rawCandidates.length;
     const samplePoints = finalizeSamplePlan({
       rawCandidates,
       subtitleSegments: metaInfo.segments,
@@ -449,7 +591,6 @@ async function runExtractVideoInternal(
       maxFrames: effectiveMaxFrames,
     });
 
-    // Release unpicked candidate promises immediately
     const chosenSet = new Set(samplePoints.map((p) => p.payload));
     for (const c of rawCandidates) {
       if (c.payload && !chosenSet.has(c.payload)) {
@@ -473,11 +614,10 @@ async function runExtractVideoInternal(
       }))
     );
 
-    // Defensive fallback if any edge-case point lacked an in-memory buffer
     const missing = extractedFrames.filter((f) => !f.frameBuffer);
-    if (missing.length > 0) {
-      const tempFramesDir = path.join(paths.cacheDir, 'tmp_frames');
-      try {
+    const tempFramesDir = path.join(paths.cacheDir, 'tmp_frames');
+    try {
+      if (missing.length > 0) {
         const recovered = await extractLanczosFrames({
           videoPath,
           samplePoints: missing,
@@ -489,25 +629,26 @@ async function runExtractVideoInternal(
         extractedFrames = extractedFrames.map((f) =>
           f.frameBuffer ? f : { ...f, framePath: recMap.get(f.frameNo) }
         );
-      } finally {
+      }
+
+      const composed = await composeGrids({
+        extractedFrames,
+        gridsDir: paths.gridsDir,
+        relativeDirPrefix: 'grids',
+        sourceStreamHeight: Math.min(probe.width || 0, probe.height || 0) || probe.height,
+      });
+      indexPayload = composed.indexPayload;
+    } finally {
+      if (missing.length > 0) {
         await fs.promises.rm(tempFramesDir, { recursive: true, force: true });
       }
     }
-
-    const composed = await composeGrids({
-      extractedFrames,
-      gridsDir: paths.gridsDir,
-      relativeDirPrefix: 'grids',
-      sourceStreamHeight: Math.min(probe.width || 0, probe.height || 0) || probe.height,
-    });
-    indexPayload = composed.indexPayload;
   } finally {
     if (!keepVideoCache && paths?.cacheDir) {
       await fs.promises.rm(paths.cacheDir, { recursive: true, force: true });
     }
   }
 
-  // Clean any legacy artifact directories if re-extracting into an existing folder
   await Promise.all([
     fs.promises.rm(path.join(paths.bundleDir, 'sprites'), { recursive: true, force: true }),
     fs.promises.rm(path.join(paths.bundleDir, 'subtitles'), { recursive: true, force: true }),
@@ -517,7 +658,7 @@ async function runExtractVideoInternal(
   const { segments: _omitSegments, ...manifestBody } = metaInfo;
   const manifest = {
     ...manifestBody,
-    duration_sec: roundSec(durationSec, 2),
+    duration_sec: roundSec(metaInfo.duration_sec, 2),
     total_frames: indexPayload.total_frames,
     total_grids: indexPayload.total_grids,
     grid_files: (indexPayload.grids || []).map((g) => g.file),
@@ -540,9 +681,6 @@ function isBundleComplete(paths) {
   }
 }
 
-/**
- * Return compact video summary and ONLY core output paths (transcript.md + grid_files).
- */
 async function buildPathsOnlyReturnPayload(paths) {
   const manifest = JSON.parse(await fs.promises.readFile(paths.manifestPath, 'utf8'));
   const gridFiles = (manifest.grid_files || []).map((rel) => path.join(paths.bundleDir, rel));

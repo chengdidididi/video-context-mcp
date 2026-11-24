@@ -1,6 +1,32 @@
 import { formatTranscriptTimestamp, parseTimestampSec, roundSec } from '../utils/time.js';
 
 /**
+ * Strip ASR model control tokens (e.g. SenseVoice <|zh|><|NEUTRAL|><|Speech|><|withitn|>, emotion/BGM emojis)
+ * and common Whisper silent-chunk boilerplate hallucinations.
+ */
+export function cleanAsrText(rawStr) {
+  const cleaned = String(rawStr || '')
+    .replace(/<\|[^|>]+\|>/g, '')
+    .replace(/^[🎼🎵🎶👏😀😊😔😡😨🤢😮🤧😭]+\s*/gu, '')
+    .replace(/\s*[🎼🎵🎶👏😀😊😔😡😨🤢😮🤧😭]+$/gu, '')
+    .replace(/\r?\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) return '';
+
+  if (
+    /^(字幕由\s*Amara\.org|Subtitles by the Amara\.org|Thank you for watching\.?|Thanks for watching\.?)$/i.test(
+      cleaned
+    )
+  ) {
+    return '';
+  }
+
+  return cleaned;
+}
+
+/**
  * Parse Bilibili BCC JSON subtitle format: { body: [{ from, to, content }] }
  */
 export function parseBilibiliBccJson(rawJson) {
@@ -47,8 +73,10 @@ export function parseYoutubeJson3(rawJson) {
 /**
  * Parse WebVTT or SRT subtitle text, handling YouTube auto-caption rolling 2-line duplicates & <c> word tags.
  */
-export function parseVttOrSrt(rawText) {
-  const lines = rawText.replace(/^\uFEFF/, '').split(/\r?\n/);
+export function parseVttOrSrt(rawText, { merge = true } = {}) {
+  const lines = String(rawText || '')
+    .replace(/^\uFEFF/, '')
+    .split(/\r?\n/);
   const rawSegments = [];
 
   const timeArrowRegex =
@@ -74,14 +102,12 @@ export function parseVttOrSrt(rawText) {
       i++;
     }
 
-    // Skip ultra-short 10ms rollup transition cues if identical text follows
     const cleanedLines = cueLines
-      .map((l) => cleanInlineText(l))
+      .map((l) => cleanAsrText(cleanInlineText(l)))
       .filter(Boolean);
 
     if (cleanedLines.length === 0) continue;
 
-    // Join multi-line cue while avoiding internal duplicate lines
     const dedupedCueLines = [];
     for (const cl of cleanedLines) {
       if (dedupedCueLines[dedupedCueLines.length - 1] !== cl) {
@@ -99,7 +125,7 @@ export function parseVttOrSrt(rawText) {
     });
   }
 
-  return cleanAndMergeSegments(rawSegments);
+  return merge ? cleanAndMergeSegments(rawSegments) : rawSegments;
 }
 
 /**
@@ -107,9 +133,9 @@ export function parseVttOrSrt(rawText) {
  */
 function cleanInlineText(str) {
   return str
-    .replace(/<\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3}>/g, '') // VTT inline word timestamps
-    .replace(/<\/?[^>]+>/g, '') // HTML/VTT tags (<c>, <b>, <font>, etc.)
-    .replace(/\{\\[^}]+\}/g, '') // ASS/SSA override tags like {\an8}
+    .replace(/<\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3}>/g, '')
+    .replace(/<\/?[^>]+>/g, '')
+    .replace(/\{\\[^}]+\}/g, '')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
@@ -121,20 +147,16 @@ function cleanInlineText(str) {
 }
 
 /**
- * Core deduplication & semantic sentence merging pipeline:
- * 1. Eliminates YouTube rolling overlap (where segment B starts with or contains segment A)
- * 2. Eliminates consecutive identical noise markers ([Music], [音乐], etc.)
- * 3. Merges tiny fragmented cues into readable semantic sentences while keeping accurate start/end
+ * Core deduplication & semantic sentence merging pipeline.
  */
 export function cleanAndMergeSegments(rawSegments) {
   if (!rawSegments || rawSegments.length === 0) return [];
 
   const sorted = [...rawSegments].sort((a, b) => a.start - b.start || a.end - b.end);
 
-  // Pass 1: Rolling overlap deduplication (crucial for YouTube auto-generated VTT)
   const deduped = [];
   for (const seg of sorted) {
-    const text = seg.text.trim();
+    const text = cleanAsrText(seg.text);
     if (!text) continue;
 
     if (deduped.length === 0) {
@@ -144,19 +166,16 @@ export function cleanAndMergeSegments(rawSegments) {
 
     const prev = deduped[deduped.length - 1];
 
-    // Exact duplicate within close time window
     if (prev.text === text && seg.start - prev.end < 3.0) {
       prev.end = Math.max(prev.end, seg.end);
       continue;
     }
 
-    // Progressive growth: e.g. prev="Hello world" -> seg="Hello world how are you"
     if (text.startsWith(prev.text) && seg.start - prev.end < 2.0) {
       const suffix = text.slice(prev.text.length).trim();
       if (!suffix) {
         prev.end = Math.max(prev.end, seg.end);
       } else if (prev.end - prev.start < 0.5) {
-        // Previous was a transient rollup flash cue: absorb into current
         prev.text = text;
         prev.end = Math.max(prev.end, seg.end);
       } else {
@@ -166,7 +185,6 @@ export function cleanAndMergeSegments(rawSegments) {
       continue;
     }
 
-    // Suffix-prefix sliding overlap: e.g. prev="today we are going to build", seg="going to build a server"
     const overlapLen = findSuffixPrefixOverlap(prev.text, text);
     if (overlapLen >= 4 && seg.start - prev.end < 2.0) {
       const remainder = text.slice(overlapLen).trim();
@@ -185,7 +203,6 @@ export function cleanAndMergeSegments(rawSegments) {
     deduped.push({ ...seg, text });
   }
 
-  // Pass 2: Merge ultra-short fragments into natural semantic lines (unless separated by >0.6s pause or sentence punctuation)
   const merged = [];
   const sentenceEndRegex = /[。！？.!?；;：:]$/;
   const noiseBracketRegex = /^(\[[^\]]+\]|（[^）]+）|\([^)]+\)|♪+)+$/;
@@ -198,7 +215,6 @@ export function cleanAndMergeSegments(rawSegments) {
 
     const prev = merged[merged.length - 1];
 
-    // Collapse repeated consecutive "[音乐]" / "[Music]" placeholders
     if (noiseBracketRegex.test(seg.text) && prev.text === seg.text) {
       prev.end = Math.max(prev.end, seg.end);
       continue;
@@ -232,9 +248,6 @@ export function cleanAndMergeSegments(rawSegments) {
   }));
 }
 
-/**
- * Find longest overlap where suffix of `a` equals prefix of `b`.
- */
 function findSuffixPrefixOverlap(a, b) {
   const maxLen = Math.min(a.length, b.length);
   for (let len = maxLen; len >= 4; len--) {

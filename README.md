@@ -1,6 +1,6 @@
 # video-context-mcp
 
-将 **YouTube** 与 **Bilibili** 视频（确定性 URL / BV 号 / Video ID）一步解析并打包为多模态大模型（VLM / Agent）友好的极简本地上下文包（**整合元信息与章节的 `transcript.md` + `3×3` 零遮挡顶栏时间戳拼图 `grids/`**），**MCP 响应仅回传精简统计与这两个核心输出路径**，消除大段文本与冗余索引文件的上下文损耗。
+将 **YouTube**、**Bilibili** 视频（确定性 URL / BV 号 / Video ID）或**本地视频文件**一步解析并打包为多模态大模型（VLM / Agent）友好的极简本地上下文包（**整合元信息与章节的 `transcript.md` + `3×3` 零遮挡顶栏时间戳拼图 `grids/`**；遇到无字幕视频或带音轨本地视频时自动调用显式指定的云端 ASR 渠道补齐时间轴字幕），**MCP 响应仅回传精简统计与这两个核心输出路径**，消除大段文本与冗余索引文件的上下文损耗。
 
 ---
 
@@ -26,11 +26,14 @@ winget install OpenJS.NodeJS.LTS Gyan.FFmpeg yt-dlp.yt-dlp
 
 #### A. 在 Magpie 中注册
 
-- **通过 Magpie CLI 一行注册**：
+- **通过 Magpie CLI 一行注册（以启用 Cloudflare 或小米 MiMo ASR 为例）**：
   ```bash
   magpie library mcp add video-context \
     env=VIDEO_CONTEXT_OUTPUT_DIR=/path/to/your/output \
     env="BILIBILI_COOKIE=buvid3=...; SESSDATA=..." \
+    env=VIDEO_CONTEXT_ASR_PROVIDER=cloudflare \
+    env=CLOUDFLARE_ACCOUNT_ID=你的32位Account_ID \
+    env=CLOUDFLARE_API_KEY=你的CF_Token \
     timeout=300 \
     -- npx -y github:chengdidididi/video-context-mcp
   ```
@@ -39,7 +42,7 @@ winget install OpenJS.NodeJS.LTS Gyan.FFmpeg yt-dlp.yt-dlp
   - **Command**：`npx`（macOS GUI 若找不到环境变量可填 `/opt/homebrew/bin/npx`）
   - **Args**：`-y` `github:chengdidididi/video-context-mcp`
   - **Timeout**：`300`
-  - **Env**：填入 `VIDEO_CONTEXT_OUTPUT_DIR` 与 `BILIBILI_COOKIE`（见下方配置表），添加后为目标 Agent 打开开关即可。
+  - **Env**：填入 `VIDEO_CONTEXT_OUTPUT_DIR`、`BILIBILI_COOKIE`、必选渠道 `VIDEO_CONTEXT_ASR_PROVIDER`（如 `cloudflare` / `mimo` / `siliconflow`）及对应渠道 Key（见下方配置表），添加后为目标 Agent 打开开关即可。
 
 #### B. 标准 `mcp_config.json` 远程注册（Claude Desktop / Cursor / Antigravity / Cherry Studio 等）
 
@@ -54,7 +57,9 @@ winget install OpenJS.NodeJS.LTS Gyan.FFmpeg yt-dlp.yt-dlp
       ],
       "env": {
         "VIDEO_CONTEXT_OUTPUT_DIR": "/path/to/your/output",
-        "BILIBILI_COOKIE": "buvid3=...; SESSDATA=..."
+        "BILIBILI_COOKIE": "buvid3=...; SESSDATA=...",
+        "VIDEO_CONTEXT_ASR_PROVIDER": "mimo",
+        "MIMO_API_KEY": "sk-..."
       }
     }
   }
@@ -96,6 +101,11 @@ magpie library mcp add video-context --local timeout=300 \
 | `runtime.timeout_sec` | `VIDEO_CONTEXT_TIMEOUT_SEC` | `300` | 下载与媒体处理的全局单任务超时上限（秒，默认 5 分钟；执行期间每 5s 发送 MCP `notifications/progress` 心跳保活） |
 | `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
 | `auth.allow_guest_degraded` | `VIDEO_CONTEXT_ALLOW_GUEST` | `false` | 未配 B 站 Cookie 时是否允许降级为 360p 无 AI 字幕游客模式 |
+| `asr.provider` | `VIDEO_CONTEXT_ASR_PROVIDER` | `""` | **必填指定**的唯一云端 ASR 渠道（如 `"siliconflow"` / `"mimo"` / `"cloudflare"`；触发 ASR 时未指定将直接报错阻断） |
+| `asr.language` / `asr.prompt` | `VIDEO_CONTEXT_ASR_LANGUAGE` / `VIDEO_CONTEXT_ASR_PROMPT` | `"auto"` / `""` | ASR 语言提示与可选热词上下文 |
+| `asr.providers.siliconflow.*` | `SILICONFLOW_API_KEY` / `SILICONFLOW_MODEL` 等 | `SenseVoiceSmall` | `openai-transcriptions` 协议槽位（短切片赋时档） |
+| `asr.providers.mimo.*` | `MIMO_API_KEY` / `MIMO_MODEL` 等 | `mimo-v2.5-asr` | `openai-chat-audio` 协议槽位（自动 Data URL 封装 + 短切片赋时档） |
+| `asr.providers.cloudflare.*` | `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_KEY` 等 | `whisper-large-v3-turbo` | `cloudflare` 协议槽位（75~90s 长切片 + 原生逐句时间轴档） |
 | `sampling.probe_fps` | `VIDEO_CONTEXT_PROBE_FPS` | `2.5` | 内存灰度探针流采样帧率（默认每 `0.4s` 扫描一次） |
 | `sampling.diff_threshold` | `VIDEO_CONTEXT_DIFF_THRESHOLD` | `0.15` | **第一道栅栏**：`8×6` 局部块相对上一入选帧的累积视觉变化阈值 |
 | `sampling.settle_threshold` | `VIDEO_CONTEXT_SETTLE_THRESHOLD` | `0.045` | **第二道栅栏**：动后取静（Settle）帧间稳定阈值（跳过滚动模糊与转场残影） |

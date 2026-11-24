@@ -210,28 +210,7 @@ export async function fetchBilibiliSubtitlesAndChapters(bvid, cid, cookieHeader,
   };
 }
 
-/**
- * Download Bilibili pure video DASH stream (.m4s single-file fMP4) directly via WBI playurl API,
- * prioritizing official upos-*.bilivideo.com CDN mirrors over flaky mcdn/szbdyd PCDN (avoids HTTP 567).
- */
-export async function downloadBilibiliDashStream({
-  bvid,
-  cid,
-  destDir,
-  cookieHeader = '',
-  wbiKeys = null,
-  targetShortSide = 360,
-}) {
-  await fs.promises.mkdir(destDir, { recursive: true });
-  const prefix = 'source_video';
-  const existing = (await fs.promises.readdir(destDir)).find(
-    (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part')
-  );
-  if (existing) {
-    const full = path.join(destDir, existing);
-    if ((await fs.promises.stat(full)).size > 1024) return full;
-  }
-
+async function fetchBilibiliPlayurlData({ bvid, cid, cookieHeader = '', wbiKeys = null }) {
   const effectiveCookies = await ensureBilibiliFingerCookies(cookieHeader);
   const params = {
     bvid,
@@ -256,10 +235,41 @@ export async function downloadBilibiliDashStream({
   if (json.code !== 0 || !json.data) {
     throw new Error(`Bilibili playurl error (${json.code}): ${json.message || 'Unknown'}`);
   }
+  return { data: json.data, effectiveCookies };
+}
 
-  const dashVideos = json.data.dash?.video || [];
+/**
+ * Download Bilibili pure video DASH stream (.m4s single-file fMP4) directly via WBI playurl API,
+ * prioritizing official upos-*.bilivideo.com CDN mirrors over flaky mcdn/szbdyd PCDN (avoids HTTP 567).
+ */
+export async function downloadBilibiliDashStream({
+  bvid,
+  cid,
+  destDir,
+  cookieHeader = '',
+  wbiKeys = null,
+  targetShortSide = 360,
+}) {
+  await fs.promises.mkdir(destDir, { recursive: true });
+  const prefix = 'source_video';
+  const existing = (await fs.promises.readdir(destDir)).find(
+    (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part')
+  );
+  if (existing) {
+    const full = path.join(destDir, existing);
+    if ((await fs.promises.stat(full)).size > 1024) return full;
+  }
+
+  const { data, effectiveCookies } = await fetchBilibiliPlayurlData({
+    bvid,
+    cid,
+    cookieHeader,
+    wbiKeys,
+  });
+
+  const dashVideos = data.dash?.video || [];
   if (dashVideos.length === 0) {
-    const durl = json.data.durl?.[0];
+    const durl = data.durl?.[0];
     if (!durl) throw new Error('No DASH or durl video streams returned by Bilibili playurl');
     const urls = rankBilibiliCdnUrls([durl.url, ...(durl.backup_url || [])]);
     const destPath = path.join(destDir, `${prefix}.mp4`);
@@ -295,6 +305,80 @@ export async function downloadBilibiliDashStream({
   }
 
   throw lastErr || new Error('Failed to download Bilibili DASH stream from all mirrors');
+}
+
+/**
+ * Download Bilibili compact DASH audio stream (.m4s, ~64kbps 30216 preferred) ONLY when needed for ASR fallback.
+ * Returns null if the video physically has no audio stream.
+ */
+export async function downloadBilibiliDashAudio({
+  bvid,
+  cid,
+  destDir,
+  cookieHeader = '',
+  wbiKeys = null,
+  preferredAudioKbps = 96,
+}) {
+  await fs.promises.mkdir(destDir, { recursive: true });
+  const prefix = 'source_audio';
+  const existing = (await fs.promises.readdir(destDir)).find(
+    (f) => f.startsWith(`${prefix}.`) && !f.endsWith('.part')
+  );
+  if (existing) {
+    const full = path.join(destDir, existing);
+    if ((await fs.promises.stat(full)).size > 1024) return full;
+  }
+
+  const { data, effectiveCookies } = await fetchBilibiliPlayurlData({
+    bvid,
+    cid,
+    cookieHeader,
+    wbiKeys,
+  });
+
+  const dashAudios = [
+    ...(data.dash?.audio || []),
+    ...(data.dash?.dolby?.audio || []),
+  ];
+
+  if (dashAudios.length === 0) {
+    const durl = data.durl?.[0];
+    if (durl) {
+      const urls = rankBilibiliCdnUrls([durl.url, ...(durl.backup_url || [])]);
+      const destPath = path.join(destDir, `${prefix}.mp4`);
+      await downloadFromMirrorList(urls, destPath, effectiveCookies);
+      return destPath;
+    }
+    return null;
+  }
+
+  const targetOrder =
+    preferredAudioKbps <= 96 ? [30216, 30232, 30280] : [30232, 30216, 30280];
+
+  const scored = dashAudios
+    .map((a) => {
+      const idIdx = targetOrder.indexOf(Number(a.id));
+      const idRank = idIdx !== -1 ? idIdx : 99;
+      const bw = Number(a.bandwidth || 999_999_999);
+      return { stream: a, idRank, bw };
+    })
+    .sort((a, b) => a.idRank - b.idRank || a.bw - b.bw);
+
+  let lastErr = null;
+  for (const cand of scored.slice(0, 4)) {
+    const a = cand.stream;
+    const rawUrls = [a.baseUrl || a.base_url, ...(a.backupUrl || a.backup_url || [])].filter(Boolean);
+    const urls = rankBilibiliCdnUrls(rawUrls);
+    const destPath = path.join(destDir, `${prefix}.m4s`);
+    try {
+      await downloadFromMirrorList(urls, destPath, effectiveCookies);
+      return destPath;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  throw lastErr || new Error('Failed to download Bilibili DASH audio stream from all mirrors');
 }
 
 function rankBilibiliCdnUrls(urls) {

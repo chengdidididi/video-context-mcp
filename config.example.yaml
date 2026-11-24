@@ -7,7 +7,7 @@ output:
   # 环境变量: VIDEO_CONTEXT_OUTPUT_DIR
   dir: "./output"
 
-  # 抽帧拼图完成后是否保留 cache/ 下的临时原视频流（默认 false 用完即删，避免占用磁盘）
+  # 抽帧拼图完成后是否保留 cache/ 下的临时视频/音频流（默认 false 用完即删，避免占用磁盘）
   # 环境变量: VIDEO_CONTEXT_KEEP_VIDEO_CACHE
   keep_video_cache: false
 
@@ -25,6 +25,70 @@ auth:
   # 未配置 Bilibili Cookie 时是否允许降级为 360p 无 AI 字幕游客模式（默认 false 阻断提示）
   # 环境变量: VIDEO_CONTEXT_ALLOW_GUEST
   allow_guest_degraded: false
+
+asr:
+  # 当在线视频无任何可用字幕，或传入带音轨的本地视频文件时，强制使用此处显式指定的唯一 ASR 渠道
+  # 必须显式填写下方 providers 中的渠道名（如 "siliconflow" | "mimo" | "cloudflare" 或自定义槽位名）；留空时若触发 ASR 将直接报错阻断
+  # 环境变量: VIDEO_CONTEXT_ASR_PROVIDER
+  provider: ""
+
+  # 识别语言提示（"auto" 为自动识别，或填 "zh" / "en" / "ja" / "yue" 等 ISO 语言代码）
+  # 环境变量: VIDEO_CONTEXT_ASR_LANGUAGE
+  language: "auto"
+
+  # 可选热词/上下文提示词（适用于支持 initial_prompt / prompt 的模型）
+  # 环境变量: VIDEO_CONTEXT_ASR_PROMPT
+  prompt: ""
+
+  # 安全护栏：单视频允许执行云端 ASR 的最大时长（秒，默认 7200 = 2 小时）
+  # 环境变量: VIDEO_CONTEXT_ASR_MAX_DURATION_SEC
+  max_duration_sec: 7200
+
+  # 分片并发请求数、单分片 HTTP 超时（秒）与失败重试次数
+  # 环境变量: VIDEO_CONTEXT_ASR_CONCURRENCY / VIDEO_CONTEXT_ASR_REQUEST_TIMEOUT_SEC / VIDEO_CONTEXT_ASR_MAX_RETRIES
+  concurrency: 3
+  request_timeout_sec: 60
+  max_retries: 2
+
+  # 可同时保存多个渠道的凭证，实际请求严格只走上方 asr.provider 指定的唯一渠道
+  # 也支持按三种协议（openai-transcriptions | openai-chat-audio | cloudflare）自行新增自定义渠道名（如 groq / stepfun）
+  providers:
+    # 1) openai-transcriptions 协议：硅基流动（免费 SenseVoiceSmall，亦可改为 Qwen/Qwen3-ASR-1.7B 等）
+    siliconflow:
+      # 环境变量: SILICONFLOW_PROTOCOL / SILICONFLOW_BASE_URL / SILICONFLOW_ENDPOINT_PATH / SILICONFLOW_API_KEY / SILICONFLOW_MODEL / SILICONFLOW_RESPONSE_FORMAT
+      protocol: "openai-transcriptions"
+      base_url: "https://api.siliconflow.cn/v1"
+      endpoint_path: "/audio/transcriptions"
+      api_key: ""
+      model: "FunAudioLLM/SenseVoiceSmall"
+      response_format: ""
+      auth_header: "Authorization"
+      auth_prefix: "Bearer "
+
+    # 2) openai-chat-audio 协议：小米 MiMo 开放平台（mimo-v2.5-asr）
+    mimo:
+      # 环境变量: MIMO_PROTOCOL / MIMO_BASE_URL / MIMO_ENDPOINT_PATH / MIMO_API_KEY / MIMO_MODEL / MIMO_AUDIO_DATA_STYLE / MIMO_INCLUDE_ASR_OPTIONS
+      protocol: "openai-chat-audio"
+      base_url: "https://api.xiaomimimo.com/v1"
+      endpoint_path: "/chat/completions"
+      api_key: ""
+      model: "mimo-v2.5-asr"
+      audio_data_style: "data_url"
+      user_prompt: ""
+      include_asr_options: true
+      auth_header: "Authorization"
+      auth_prefix: "Bearer "
+
+    # 3) cloudflare 协议：Cloudflare Workers AI（每日免费 10,000 Neurons，必填 account_id 与 api_key）
+    cloudflare:
+      # 环境变量: CLOUDFLARE_PROTOCOL / CLOUDFLARE_BASE_URL / CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY / CLOUDFLARE_MODEL / CLOUDFLARE_VAD_FILTER
+      protocol: "cloudflare"
+      base_url: "https://api.cloudflare.com/client/v4"
+      account_id: ""
+      api_key: ""
+      model: "@cf/openai/whisper-large-v3-turbo"
+      payload_mode: "base64_json"
+      vad_filter: true
 
 sampling:
   # 灰度探针流采样帧率（默认 2.5 fps，即每 0.4s 扫描一次画面状态）

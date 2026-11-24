@@ -7,17 +7,15 @@ import { getEnhancedEnv, getGridSpec, getTimeoutMs, resolveBinary } from '../con
 import { mapWithConcurrency, runCommand } from '../utils/exec.js';
 
 /**
- * Probe video stream dimensions, codec, and duration via ffprobe.
+ * Probe video & audio stream presence, dimensions, fps, codec, and duration via ffprobe.
  */
 export async function probeVideo(videoPath) {
   const ffprobe = resolveBinary('ffprobe');
   const args = [
     '-v',
     'error',
-    '-select_streams',
-    'v:0',
     '-show_entries',
-    'stream=width,height,codec_name:format=duration',
+    'stream=codec_type,width,height,codec_name,avg_frame_rate,r_frame_rate:format=duration',
     '-of',
     'json',
     videoPath,
@@ -25,15 +23,94 @@ export async function probeVideo(videoPath) {
 
   const { stdout } = await runCommand(ffprobe, args, { timeoutMs: 20_000 });
   const parsed = JSON.parse(stdout);
-  const stream = parsed.streams?.[0] || {};
+  const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+  const vStream = streams.find((s) => s.codec_type === 'video') || {};
+  const aStream = streams.find((s) => s.codec_type === 'audio') || null;
   const format = parsed.format || {};
 
+  const parseRate = (rateStr) => {
+    if (!rateStr || typeof rateStr !== 'string') return 0;
+    if (rateStr.includes('/')) {
+      const [num, den] = rateStr.split('/').map(Number);
+      return den > 0 ? num / den : 0;
+    }
+    return Number(rateStr) || 0;
+  };
+
+  const fps = parseRate(vStream.avg_frame_rate) || parseRate(vStream.r_frame_rate) || 0;
+
   return {
-    width: Number(stream.width || 0),
-    height: Number(stream.height || 0),
-    codec: stream.codec_name || 'unknown',
+    hasVideo: Boolean(vStream.codec_type === 'video'),
+    hasAudio: Boolean(aStream),
+    width: Number(vStream.width || 0),
+    height: Number(vStream.height || 0),
+    fps,
+    codec: vStream.codec_name || 'unknown',
+    audioCodec: aStream?.codec_name || null,
     durationSec: Number(format.duration || 0),
   };
+}
+
+/**
+ * Compress an uploaded/local video file into a standardized 360p@<=30fps pure video stream inside cache/
+ * (never mutating or deleting the user's original local video file), matching the online cached stream pipeline.
+ */
+export async function transcodeLocalVideoToCompactCache(
+  localVideoPath,
+  cacheDir,
+  { targetShortSide = 360, maxFps = 30, timeoutMs = getTimeoutMs() } = {}
+) {
+  await fs.promises.mkdir(cacheDir, { recursive: true });
+  const outPath = path.join(cacheDir, 'source_video.mp4');
+
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1024) {
+    return outPath;
+  }
+
+  const probe = await probeVideo(localVideoPath);
+  if (!probe.hasVideo) {
+    throw new Error(`Local file does not contain a valid video stream: "${localVideoPath}"`);
+  }
+
+  const ffmpeg = resolveBinary('ffmpeg');
+  const capSide = Math.max(240, Number(targetShortSide) || 360);
+  const filters = [];
+  if (probe.fps > maxFps + 0.5) {
+    filters.push(`fps=${maxFps}`);
+  }
+  // Scale short side down to 360p (preserving aspect ratio, even dimensions, no upscaling)
+  filters.push(
+    `scale='if(gt(iw,ih),-2,min(iw,${capSide}))':'if(gt(iw,ih),min(ih,${capSide}),-2)':flags=bicubic`
+  );
+
+  const partPath = `${outPath}.part.mp4`;
+  const args = [
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-threads',
+    '0',
+    '-y',
+    '-i',
+    localVideoPath,
+    '-vf',
+    filters.join(','),
+    '-an',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '23',
+    '-pix_fmt',
+    'yuv420p',
+    partPath,
+  ];
+
+  await runCommand(ffmpeg, args, { timeoutMs });
+  await fs.promises.rename(partPath, outPath);
+  return outPath;
 }
 
 /**
