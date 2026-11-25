@@ -1,6 +1,6 @@
 # video-context-mcp
 
-将 **YouTube**、**Bilibili** 视频（确定性 URL / BV 号 / Video ID）或**本地视频文件**一步解析并打包为多模态大模型（VLM / Agent）友好的极简本地上下文包（**整合元信息与章节的 `transcript.md` + `3×3` 零遮挡顶栏时间戳拼图 `grids/`**；遇到无字幕视频或带音轨本地视频时自动调用显式指定的云端 ASR 渠道补齐时间轴字幕），**MCP 响应仅回传精简统计与这两个核心输出路径**，消除大段文本与冗余索引文件的上下文损耗。
+将 **YouTube**、**Bilibili** 视频（确定性 URL / BV 号 / Video ID）或**本地视频文件**一步解析并打包为多模态大模型（VLM / Agent）友好的极简本地上下文包（**整合元信息与章节的 `transcript.md` + 横屏 `3×3` / 竖屏 `5×2` 零遮挡顶栏时间戳拼图 `grids/`**；遇到无字幕视频或带音轨本地视频时自动调用显式指定的云端 ASR 渠道补齐时间轴字幕，支持分片断点续传缓存），**MCP 响应仅回传精简统计与这两个核心输出路径**，消除大段文本与冗余索引文件的上下文损耗。
 
 ---
 
@@ -103,6 +103,7 @@ magpie library mcp add video-context --local timeout=300 \
 | `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
 | `auth.allow_guest_degraded` | `VIDEO_CONTEXT_ALLOW_GUEST` | `false` | 未配 B 站 Cookie 时是否允许降级为 360p 无 AI 字幕游客模式 |
 | `asr.provider` | `VIDEO_CONTEXT_ASR_PROVIDER` | `""` | **必填指定**的唯一云端 ASR 渠道（如 `"siliconflow"` / `"mimo"` / `"cloudflare"`；触发 ASR 时未指定将直接报错阻断） |
+| `asr.concurrency` | `VIDEO_CONTEXT_ASR_CONCURRENCY` | `2` | 单视频 ASR 分片上传并发数（默认 `2` 路并发，配合分片级断点缓存避免触发上游 `429` 限流与全量重传） |
 | `asr.language` / `asr.prompt` | `VIDEO_CONTEXT_ASR_LANGUAGE` / `VIDEO_CONTEXT_ASR_PROMPT` | `"auto"` / `""` | ASR 语言提示与可选热词上下文 |
 | `asr.providers.siliconflow.*` | `SILICONFLOW_API_KEY` / `SILICONFLOW_MODEL` 等 | `SenseVoiceSmall` | `openai-transcriptions` 协议槽位（短切片赋时档） |
 | `asr.providers.mimo.*` | `MIMO_API_KEY` / `MIMO_MODEL` 等 | `mimo-v2.5-asr` | `openai-chat-audio` 协议槽位（自动 Data URL 封装 + 短切片赋时档） |

@@ -38,7 +38,7 @@ export const DEFAULT_CONFIG = {
     language: 'auto',
     prompt: '',
     max_duration_sec: 7200,
-    concurrency: 6,
+    concurrency: 2,
     request_timeout_sec: 300,
     max_retries: 2,
     providers: {

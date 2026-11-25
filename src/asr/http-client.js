@@ -12,11 +12,12 @@ export class AsrApiError extends Error {
 }
 
 const RETRIABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const FIXED_RETRY_DELAY_MS = 1500;
 
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(signal.reason || new Error('Aborted during retry backoff'));
+      reject(signal.reason || new Error('Aborted during retry wait'));
       return;
     }
     const timer = setTimeout(() => {
@@ -25,7 +26,7 @@ function sleep(ms, signal) {
     }, ms);
     const onAbort = () => {
       clearTimeout(timer);
-      reject(signal.reason || new Error('Aborted during retry backoff'));
+      reject(signal.reason || new Error('Aborted during retry wait'));
     };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
   });
@@ -46,7 +47,7 @@ export async function fetchAsrWithRetry(
     const controller = new AbortController();
     let timedOut = false;
     const onParentAbort = () => {
-      controller.abort(parentSignal.reason || new Error(`${label} interrupted by pipeline abort`));
+      controller.abort(parentSignal.reason || new Error(`${label} interrupted`));
     };
     if (parentSignal) {
       parentSignal.addEventListener('abort', onParentAbort, { once: true });
@@ -54,7 +55,7 @@ export async function fetchAsrWithRetry(
 
     const timer = setTimeout(() => {
       timedOut = true;
-      controller.abort(new Error(`${label} request timed out after ${Math.round(timeoutMs / 1000)}s`));
+      controller.abort(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`));
     }, timeoutMs);
 
     try {
@@ -70,60 +71,38 @@ export async function fetchAsrWithRetry(
         const retriable = RETRIABLE_STATUSES.has(res.status);
         const apiErr = new AsrApiError(
           `[${label}] HTTP ${res.status} from ${url}: ${snippet}`,
-          {
-            status: res.status,
-            url,
-            bodySnippet: snippet,
-            retriable,
-          }
+          { status: res.status, url, bodySnippet: snippet, retriable }
         );
-
         if (retriable && attempt < maxRetries && !parentSignal?.aborted) {
           lastErr = apiErr;
-          const retryAfterSec = Number(res.headers.get('retry-after') || 0);
-          const delayMs =
-            retryAfterSec > 0 && retryAfterSec <= 15
-              ? retryAfterSec * 1000
-              : 800 * 2 ** attempt;
-          console.error(
-            `[video-context] ${label} HTTP ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delayMs}ms...`
-          );
-          await sleep(delayMs, parentSignal);
+          await sleep(FIXED_RETRY_DELAY_MS, parentSignal);
           continue;
         }
         throw apiErr;
       }
 
-      let parsedJson = null;
+      let json = null;
       try {
-        parsedJson = JSON.parse(rawText);
+        json = JSON.parse(rawText);
       } catch {
-        // Response may be plain text / VTT / SRT
+        // plain text / VTT / SRT
       }
-
-      return {
-        status: res.status,
-        rawText,
-        json: parsedJson,
-      };
+      return { status: res.status, rawText, json };
     } catch (err) {
       if (parentSignal?.aborted) {
         throw parentSignal.reason || new Error(`${label} interrupted by pipeline timeout`);
       }
-      if (timedOut) {
-        lastErr = new Error(`[${label}] Request timed out after ${Math.round(timeoutMs / 1000)}s (${url})`);
-      } else if (err instanceof AsrApiError && !err.retriable) {
+      if (err instanceof AsrApiError && !err.retriable) {
         throw err;
-      } else {
-        lastErr = new Error(`[${label}] Network error (${url}): ${err?.message || String(err)}`);
       }
+      lastErr = timedOut
+        ? new Error(`[${label}] Request timed out after ${Math.round(timeoutMs / 1000)}s (${url})`)
+        : err instanceof AsrApiError
+          ? err
+          : new Error(`[${label}] Network error (${url}): ${err?.message || String(err)}`);
 
       if (attempt < maxRetries && !parentSignal?.aborted) {
-        const delayMs = 800 * 2 ** attempt;
-        console.error(
-          `[video-context] ${label} transient error (${lastErr.message}), retrying in ${delayMs}ms...`
-        );
-        await sleep(delayMs, parentSignal);
+        await sleep(FIXED_RETRY_DELAY_MS, parentSignal);
         continue;
       }
       throw lastErr;

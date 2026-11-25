@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { getConfigFilePath } from '../config.js';
 import { cleanAndMergeSegments } from '../parsers/subtitles.js';
 import { mapWithConcurrency } from '../utils/exec.js';
@@ -153,14 +154,16 @@ export async function transcribeAudioMedia({
     `[video-context] Running cloud ASR via [${providerName}/${protocol}] on ${prepared.chunks.length} chunk(s) (${prepared.chunkTier}, ${Math.round(prepared.durationSec)}s audio)...`
   );
 
-  const concurrency = Math.max(1, Math.min(12, Number(asrConfig.concurrency || 6)));
+  const concurrency = Math.max(1, Math.min(8, Number(asrConfig.concurrency || 2)));
   const configuredReqMs = Math.max(15, Number(asrConfig.request_timeout_sec || 300)) * 1000;
   const effectiveReqMs = budgetTimeoutMs ? Math.min(configuredReqMs, budgetTimeoutMs) : configuredReqMs;
   const maxRetries = Math.max(0, Number(asrConfig.max_retries ?? 2));
   const language = asrConfig.language || 'auto';
   const prompt = asrConfig.prompt || '';
+  const cacheKeyTag = `${providerName}:${protocol}:${providerCfg.model}:${language}`;
 
   let completedChunks = 0;
+  let resumedFromCache = 0;
   if (onProgress) {
     onProgress(`0/${prepared.chunks.length} chunks (${providerName})`);
   }
@@ -169,6 +172,23 @@ export async function transcribeAudioMedia({
     prepared.chunks,
     concurrency,
     async (chunk) => {
+      const chunkResultPath = `${chunk.filePath}.result.json`;
+      if (fs.existsSync(chunkResultPath)) {
+        try {
+          const cached = JSON.parse(await fs.promises.readFile(chunkResultPath, 'utf8'));
+          if (cached && cached.cacheKeyTag === cacheKeyTag && Array.isArray(cached.segments)) {
+            completedChunks += 1;
+            resumedFromCache += 1;
+            if (onProgress) {
+              onProgress(`${completedChunks}/${prepared.chunks.length} chunks (${providerName})`);
+            }
+            return { segments: cached.segments };
+          }
+        } catch {
+          // ignore corrupt cache file and re-transcribe this chunk
+        }
+      }
+
       const out = await adapterFn({
         chunk,
         providerCfg,
@@ -178,6 +198,15 @@ export async function transcribeAudioMedia({
         maxRetries,
         signal,
       });
+
+      const tmpResultPath = `${chunkResultPath}.tmp`;
+      await fs.promises.writeFile(
+        tmpResultPath,
+        JSON.stringify({ cacheKeyTag, segments: out.segments || [] }),
+        'utf8'
+      );
+      await fs.promises.rename(tmpResultPath, chunkResultPath);
+
       completedChunks += 1;
       if (onProgress) {
         onProgress(`${completedChunks}/${prepared.chunks.length} chunks (${providerName})`);
@@ -186,6 +215,12 @@ export async function transcribeAudioMedia({
     },
     signal
   );
+
+  if (resumedFromCache > 0) {
+    console.error(
+      `[video-context] Resumed ${resumedFromCache}/${prepared.chunks.length} previously completed ASR chunk(s) from cache.`
+    );
+  }
 
   const rawSegments = chunkOutputs.flatMap((o) => o.segments || []);
   const mergedSegments = cleanAndMergeSegments(rawSegments);

@@ -333,7 +333,6 @@ export async function extractVideo(options = {}) {
         stage_detail: job.stageDetail || undefined,
         elapsed_sec: elapsedSec,
         timeout_budget_sec: Math.round(totalBudgetMs / 1000),
-        partial_files_cleaned: true,
       }
     );
     abortController.abort(timeoutErr);
@@ -424,6 +423,10 @@ async function runExtractVideoInternal(
     }
   }
 
+  if (force && hadCompletedBundleBeforeRun && paths?.cacheDir) {
+    await fs.promises.rm(paths.cacheDir, { recursive: true, force: true }).catch(() => {});
+  }
+
   let succeeded = false;
 
   try {
@@ -502,6 +505,9 @@ async function runExtractVideoInternal(
         return buildPathsOnlyReturnPayload(paths);
       }
 
+      if (force && hadCompletedBundleBeforeRun) {
+        await fs.promises.rm(paths.cacheDir, { recursive: true, force: true }).catch(() => {});
+      }
       await fs.promises.mkdir(paths.bundleDir, { recursive: true });
       await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
@@ -904,9 +910,14 @@ async function runExtractVideoInternal(
       job.abortController.abort(err);
     }
 
-    // Remove incomplete bundle artifacts if this was not an already-valid prior bundle
+    // Remove incomplete outer deliverables (transcript.md / manifest.json / grids/) while keeping cache/
+    // so a retry after transient 429/network failure resumes straight from cached media & completed ASR chunks!
     if (paths?.bundleDir && !hadCompletedBundleBeforeRun) {
-      await fs.promises.rm(paths.bundleDir, { recursive: true, force: true }).catch(() => {});
+      await Promise.all([
+        fs.promises.rm(paths.manifestPath, { force: true }).catch(() => {}),
+        fs.promises.rm(paths.transcriptPath, { force: true }).catch(() => {}),
+        fs.promises.rm(paths.gridsDir, { recursive: true, force: true }).catch(() => {}),
+      ]);
     }
 
     if (
@@ -918,6 +929,10 @@ async function runExtractVideoInternal(
     }
 
     if (job.timedOut && job.signal.reason instanceof PipelineExecutionError) {
+      job.signal.reason.details = {
+        ...job.signal.reason.details,
+        resumable_cache_preserved: Boolean(paths?.cacheDir && fs.existsSync(paths.cacheDir)),
+      };
       throw job.signal.reason;
     }
 
@@ -929,11 +944,12 @@ async function runExtractVideoInternal(
         failed_stage: job.stage,
         stage_detail: job.stageDetail || undefined,
         elapsed_sec: elapsedSec,
-        partial_files_cleaned: !hadCompletedBundleBeforeRun,
+        resumable_cache_preserved: Boolean(paths?.cacheDir && fs.existsSync(paths.cacheDir)),
       }
     );
   } finally {
-    if ((!keepVideoCache || !succeeded) && paths?.cacheDir) {
+    // Clean temporary cache/ ONLY after the full bundle succeeds (when keep_video_cache is false)
+    if (succeeded && !keepVideoCache && paths?.cacheDir) {
       await fs.promises.rm(paths.cacheDir, { recursive: true, force: true }).catch(() => {});
     }
   }

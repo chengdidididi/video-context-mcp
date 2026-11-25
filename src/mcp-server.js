@@ -20,7 +20,7 @@ Video Context MCP packages deterministic YouTube/Bilibili videos or local video 
 `.trim();
 
 const TERMINAL_ERROR_INSTRUCTION =
-  'The extraction task has terminated and temporary/partial files have been cleaned up (no usable output bundle was produced for this failed run). Do NOT run shell, sleep, ls, find, or glob commands to hunt for output files; report this error reason directly to the user.';
+  'The extraction task has terminated and incomplete output files have been cleaned up (no usable output bundle was produced for this failed run). Do NOT run shell, sleep, ls, find, or glob commands to hunt for output files; report this error reason directly to the user.';
 
 function formatToolResponse(payload) {
   return {
@@ -83,7 +83,7 @@ export function createVideoContextMcpServer() {
   const server = new McpServer(
     {
       name: 'video-context-mcp',
-      version: '2.4.0',
+      version: '2.4.1',
     },
     {
       instructions: SERVER_INSTRUCTIONS,

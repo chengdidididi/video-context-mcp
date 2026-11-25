@@ -83,6 +83,7 @@ export async function transcribeChunkCloudflare({
         timeoutMs,
         maxRetries,
         label: `cloudflare(${model})`,
+        signal,
       }
     );
   };

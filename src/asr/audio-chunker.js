@@ -309,7 +309,8 @@ export function planSpeechChunks(durationSec, silences = [], chunkSpec = {}) {
 }
 
 /**
- * Normalize and slice audio into self-contained speech chunks inside cache/asr_chunks/.
+ * Normalize and slice audio into self-contained speech chunks inside cache/asr_chunks/,
+ * reusing already-sliced chunks on disk when resuming an interrupted extraction.
  */
 export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, providerCfg, signal = null) {
   const audioCfg = asrConfig.audio || {};
@@ -324,6 +325,36 @@ export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, p
   }
 
   const chunksDir = path.join(cacheDir, 'asr_chunks');
+  const manifestPath = path.join(chunksDir, 'chunks_manifest.json');
+  const specKey = JSON.stringify({
+    normSize: norm.sizeBytes,
+    codec: norm.codec,
+    tier: chunkSpec.tier,
+    target: chunkSpec.target_chunk_sec,
+    max: chunkSpec.max_chunk_sec,
+  });
+
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const saved = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
+      if (
+        saved.specKey === specKey &&
+        Array.isArray(saved.chunks) &&
+        saved.chunks.every((c) => fs.existsSync(c.filePath) && fs.statSync(c.filePath).size > 128)
+      ) {
+        return {
+          normalizedAudioPath: norm.normalizedPath,
+          normalizedSizeBytes: norm.sizeBytes,
+          durationSec: norm.durationSec,
+          chunkTier: chunkSpec.tier,
+          chunks: saved.chunks,
+        };
+      }
+    } catch {
+      // slice fresh below
+    }
+  }
+
   await fs.promises.rm(chunksDir, { recursive: true, force: true });
   await fs.promises.mkdir(chunksDir, { recursive: true });
 
@@ -341,7 +372,7 @@ export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, p
 
   const materialized = await mapWithConcurrency(
     planned,
-    6,
+    2,
     async (chunk) => {
       const slug = `${formatSlugTimestamp(chunk.startSec)}-${formatSlugTimestamp(chunk.endSec)}`;
       const fileName = `chunk_${String(chunk.index).padStart(4, '0')}_${slug}.${norm.codec}`;
@@ -381,6 +412,12 @@ export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, p
       };
     },
     signal
+  );
+
+  await fs.promises.writeFile(
+    manifestPath,
+    JSON.stringify({ specKey, chunks: materialized }, null, 2),
+    'utf8'
   );
 
   return {
