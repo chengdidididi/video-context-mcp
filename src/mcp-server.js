@@ -8,14 +8,19 @@ import {
   extractVideo,
   getAuthStatus,
   manageConfig,
+  PipelineExecutionError,
 } from './pipeline.js';
 import { AuthRequiredError } from './platforms/auth.js';
 
 const SERVER_INSTRUCTIONS = `
-Video Context MCP packages deterministic YouTube/Bilibili videos or local video files into a local Context Bundle in one call.
+Video Context MCP packages deterministic YouTube/Bilibili videos or local video files into a local Context Bundle.
 - Pass only deterministic URLs, BV IDs, av IDs, 11-char YouTube Video IDs, or existing local video file paths to video_extract (never fuzzy titles).
-- Outputs a unified transcript.md (containing metadata, description, chapters, and cleaned [MM:SS] transcript) and grids/ (Two-Gate settled 3x3 visual grids with zero-occlusion "#FrameNo | Timestamp" top bars), returning their local file paths.
+- Outputs a unified transcript.md (containing metadata, description, chapters, and cleaned [MM:SS] transcript) and grids/ (Two-Gate settled visual grids with zero-occlusion "#FrameNo | Timestamp" top bars), returning their local file paths.
+- If a long extraction returns status "RUNNING_IN_BACKGROUND", call video_extract again with the exact same arguments to continue waiting on the active background job (never run shell/sleep/find commands).
 `.trim();
+
+const TERMINAL_ERROR_INSTRUCTION =
+  'The extraction task has terminated and temporary/partial files have been cleaned up (no usable output bundle was produced for this failed run). Do NOT run shell, sleep, ls, find, or glob commands to hunt for output files; report this error reason directly to the user.';
 
 function formatToolResponse(payload) {
   return {
@@ -36,6 +41,7 @@ function formatToolError(err) {
       code: err.code,
       message: err.message,
       auth_details: err.details,
+      instruction: TERMINAL_ERROR_INSTRUCTION,
     };
   } else if (err instanceof AsrConfigRequiredError) {
     payload = {
@@ -43,12 +49,22 @@ function formatToolError(err) {
       code: err.code,
       message: err.message,
       asr_details: err.details,
+      instruction: TERMINAL_ERROR_INSTRUCTION,
+    };
+  } else if (err instanceof PipelineExecutionError) {
+    payload = {
+      error: true,
+      code: err.code,
+      message: err.message,
+      execution_details: err.details,
+      instruction: TERMINAL_ERROR_INSTRUCTION,
     };
   } else {
     payload = {
       error: true,
       code: 'EXECUTION_ERROR',
       message: err?.message || String(err),
+      instruction: TERMINAL_ERROR_INSTRUCTION,
     };
   }
 
@@ -67,17 +83,17 @@ export function createVideoContextMcpServer() {
   const server = new McpServer(
     {
       name: 'video-context-mcp',
-      version: '2.3.0',
+      version: '2.4.0',
     },
     {
       instructions: SERVER_INSTRUCTIONS,
     }
   );
 
-  // Tool 1: video_extract (Zero audio/ASR options exposed to AI)
+  // Tool 1: video_extract (Zero audio/ASR or reading-batch options exposed to AI)
   server.tool(
     'video_extract',
-    'One-shot video context extraction: accepts a deterministic YouTube/Bilibili URL/ID or a local video file path, writes cleaned transcript into transcript.md, runs single-pass Two-Gate visual sampling to compose 3x3 timestamped grids (8px gutter), auto-cleans temporary cache, and returns local file paths.',
+    'One-shot video context extraction: accepts a deterministic YouTube/Bilibili URL/ID or a local video file path, writes cleaned transcript into transcript.md, runs Two-Gate visual sampling to compose timestamped grids (3x3 landscape or 5x2 portrait, 8px gutter), auto-cleans temporary cache, and returns local file paths (or RUNNING_IN_BACKGROUND checkpoint if still running at 45s within the 300s budget).',
     {
       url_or_id: z
         .string()
@@ -130,12 +146,20 @@ export function createVideoContextMcpServer() {
       if (heartbeatTimer?.unref) heartbeatTimer.unref();
 
       try {
-        const res = await extractVideo(args);
+        const res = await extractVideo({
+          ...args,
+          use_rpc_checkpoint: true,
+        });
         if (progressToken !== undefined && typeof extra?.sendNotification === 'function') {
           extra
             .sendNotification({
               method: 'notifications/progress',
-              params: { progressToken, progress: 100, total: 100, message: 'Completed' },
+              params: {
+                progressToken,
+                progress: res.completed === false ? 60 : 100,
+                total: 100,
+                message: res.completed === false ? 'Running in background' : 'Completed',
+              },
             })
             .catch(() => {});
         }
@@ -148,7 +172,7 @@ export function createVideoContextMcpServer() {
     }
   );
 
-  // Tool 2: video_auth_status (Includes redacted read-only ASR readiness line)
+  // Tool 2: video_auth_status
   server.tool(
     'video_auth_status',
     'Check yt-dlp/ffmpeg binary availability, active output directory, active env overrides, redacted ASR readiness, and live Bilibili login status.',
@@ -179,7 +203,7 @@ export function createVideoContextMcpServer() {
         .min(15)
         .max(1800)
         .optional()
-        .describe('Persist execution timeout in seconds (default 300; env: VIDEO_CONTEXT_TIMEOUT_SEC).'),
+        .describe('Persist unified backend execution timeout in seconds (default 300; env: VIDEO_CONTEXT_TIMEOUT_SEC).'),
       bilibili_cookie: z
         .string()
         .optional()

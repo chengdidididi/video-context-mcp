@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { probeAudioStream } from './asr/audio-chunker.js';
 import {
+  AsrConfigRequiredError,
   getAsrStatusSummary,
   requireValidAsrProvider,
   transcribeAudioMedia,
@@ -9,6 +10,8 @@ import {
 import {
   ENV_VAR_MAP,
   getBilibiliCookieConfig,
+  getRpcWaitMs,
+  getTimeoutMs,
   loadEffectiveConfig,
   maskConfigSecrets,
   resolveOutputDir,
@@ -22,11 +25,15 @@ import {
   scanSinglePassVideoStream,
   transcodeLocalVideoToCompactCache,
 } from './media/ffmpeg.js';
-import { composeGrids } from './media/grid-composer.js';
+import {
+  composeGrids,
+  resolveOrientationAwareGridSpec,
+} from './media/grid-composer.js';
 import { createTwoGateTracker, finalizeSamplePlan } from './media/sampler.js';
 import { formatTranscriptMarkdown } from './parsers/subtitles.js';
 import { resolveVideoInput } from './parsers/url-parser.js';
 import {
+  AuthRequiredError,
   checkBilibiliAuth,
   checkSystemBinaries,
   ensureBilibiliAuth,
@@ -46,7 +53,27 @@ import {
 import { writeTempNetscapeCookieFile } from './utils/http.js';
 import { roundSec } from './utils/time.js';
 
+export class PipelineExecutionError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'PipelineExecutionError';
+    this.code = code; // 'PIPELINE_TIMEOUT' | 'EXECUTION_ERROR'
+    this.details = details;
+  }
+}
+
 const inFlightExtractions = new Map();
+const recentCheckpointedResults = new Map();
+const RECENT_SETTLED_TTL_MS = 120_000;
+
+function pruneRecentCheckpointedResults() {
+  const now = Date.now();
+  for (const [k, entry] of recentCheckpointedResults.entries()) {
+    if (now - entry.settledAt > RECENT_SETTLED_TTL_MS) {
+      recentCheckpointedResults.delete(k);
+    }
+  }
+}
 
 function getBundlePaths(baseOutputDir, bundleId) {
   const bundleDir = path.join(baseOutputDir, bundleId);
@@ -82,6 +109,7 @@ export async function manageConfig(updates = {}, extraDotUpdates = {}) {
     output_dir: 'output.dir',
     keep_video_cache: 'output.keep_video_cache',
     timeout_sec: 'runtime.timeout_sec',
+    rpc_wait_sec: 'runtime.rpc_wait_sec',
     bilibili_cookie: 'auth.bilibili_cookie',
     allow_guest_degraded: 'auth.allow_guest_degraded',
     probe_fps: 'sampling.probe_fps',
@@ -159,36 +187,194 @@ export async function getAuthStatus() {
   };
 }
 
+async function waitWithRpcCheckpoint(job, rpcWaitMs) {
+  if (!rpcWaitMs || rpcWaitMs <= 0) {
+    try {
+      return await job.promise;
+    } finally {
+      job.pendingCheckpointHandoff = false;
+      recentCheckpointedResults.delete(job.lockId);
+    }
+  }
+
+  let timer = null;
+  const checkpointSymbol = Symbol('checkpoint');
+  let settledWhileWaiting = false;
+  const winner = await Promise.race([
+    job.promise.then(
+      (val) => {
+        settledWhileWaiting = true;
+        return val;
+      },
+      (err) => {
+        settledWhileWaiting = true;
+        throw err;
+      }
+    ),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(checkpointSymbol), rpcWaitMs);
+      if (timer.unref) timer.unref();
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+    if (settledWhileWaiting) {
+      job.pendingCheckpointHandoff = false;
+      recentCheckpointedResults.delete(job.lockId);
+    }
+  });
+
+  if (winner !== checkpointSymbol) {
+    return winner;
+  }
+
+  job.pendingCheckpointHandoff = true;
+  const elapsedSec = roundSec((Date.now() - job.startedAt) / 1000, 1);
+  const totalBudgetSec = Math.round(job.totalBudgetMs / 1000);
+  const remainingSec = roundSec(job.remainingMs() / 1000, 1);
+
+  return {
+    completed: false,
+    status: 'RUNNING_IN_BACKGROUND',
+    bundle_id: job.bundleId,
+    current_stage: job.stage,
+    stage_detail: job.stageDetail || undefined,
+    elapsed_sec: elapsedSec,
+    total_timeout_budget_sec: totalBudgetSec,
+    remaining_budget_sec: remainingSec,
+    instruction:
+      'Extraction is actively running in the background and has NOT failed. Call video_extract again immediately with the exact same arguments to continue waiting for completion. Do NOT run shell, sleep, ls, find, or glob commands.',
+  };
+}
+
 /**
- * Unified One-Shot Video Context Pipeline:
- *  1. Resolve deterministic input (Bilibili / YouTube / Local video file)
- *  2. Obtain compact video stream (online download or FFmpeg 360p@<=30fps transcode for local files) + native subtitles
- *  3. ONLY when native subtitles are absent (or input is a local video with an audio track):
- *     strictly validate `asr.provider` in config.yaml, extract/fetch compact audio stream, and run adaptive-chunked cloud ASR
- *  4. Run Two-Gate + Cap visual sampling (leveraging native or ASR subtitle segments for synergy scoring)
- *  5. Compose zero-occlusion timestamped 3x3 grids (grids/) & auto-clean temporary cache/
- *  6. Return ONLY compact summary stats and absolute file paths.
+ * Unified One-Shot Video Context Pipeline with:
+ *  - Unconditional in-flight singleton locking (even when `force: true` is passed on follow-up calls)
+ *  - Unified 300s global AbortSignal budget across all download, FFmpeg, and ASR stages
+ *  - Proactive 45s RPC checkpoint response (`RUNNING_IN_BACKGROUND`) before upstream 50s gateway cutoff
+ *  - Parallel execution of `[Audio ASR]` and `[Single-Pass Two-Gate Video Scan]`
+ *  - Orientation-aware grids (`5x2` `360x640` for portrait, `3x3` `640x360` for landscape) + tail row cropping
  */
 export async function extractVideo(options = {}) {
-  const { url_or_id, part, output_dir, force = false } = options;
+  const {
+    url_or_id,
+    part,
+    output_dir,
+    force = false,
+    use_rpc_checkpoint = false,
+    rpc_wait_ms_override,
+  } = options;
+
+  pruneRecentCheckpointedResults();
   const resolved = await resolveVideoInput(url_or_id, part);
   const baseOutputDir = resolveOutputDir(output_dir);
   await fs.promises.mkdir(baseOutputDir, { recursive: true });
 
   const lockId = `${baseOutputDir}::${resolved.platform}:${resolved.bvid || resolved.aid || resolved.videoId}:p${resolved.part || 1}`;
-  if (!force && inFlightExtractions.has(lockId)) {
-    console.error(`[video-context] Joining in-flight extraction for ${lockId}...`);
-    return inFlightExtractions.get(lockId);
+  const rpcWaitMs =
+    rpc_wait_ms_override !== undefined
+      ? Number(rpc_wait_ms_override)
+      : use_rpc_checkpoint
+        ? getRpcWaitMs()
+        : 0;
+
+  // 1. Always join an active in-flight job for the same target (prevents duplicate concurrent extractions even with force=true)
+  if (inFlightExtractions.has(lockId)) {
+    const activeJob = inFlightExtractions.get(lockId);
+    console.error(
+      `[video-context] Joining active in-flight extraction for ${lockId} (stage: ${activeJob.stage})...`
+    );
+    return waitWithRpcCheckpoint(activeJob, rpcWaitMs);
   }
 
-  const runPromise = runExtractVideoInternal(options, resolved, baseOutputDir).finally(() => {
-    if (inFlightExtractions.get(lockId) === runPromise) {
-      inFlightExtractions.delete(lockId);
-    }
-  });
+  // 2. If a previously checkpointed job finished in the brief gap between two RPC calls, consume its result once
+  if (recentCheckpointedResults.has(lockId)) {
+    const settled = recentCheckpointedResults.get(lockId);
+    recentCheckpointedResults.delete(lockId);
+    return settled.promise;
+  }
 
-  inFlightExtractions.set(lockId, runPromise);
-  return runPromise;
+  // 3. Create new singleton job governed by unified global 300s timeout budget
+  const totalBudgetMs = getTimeoutMs();
+  const abortController = new AbortController();
+  const defaultBundleId =
+    resolved.platform === 'local'
+      ? `local_${resolved.videoId}`
+      : `${resolved.platform}_${resolved.videoId}_p${resolved.part || 1}`;
+
+  const job = {
+    lockId,
+    bundleId: defaultBundleId,
+    startedAt: Date.now(),
+    totalBudgetMs,
+    stage: 'initializing',
+    stageDetail: '',
+    timedOut: false,
+    pendingCheckpointHandoff: false,
+    abortController,
+    signal: abortController.signal,
+    setStage(stage, detail = '') {
+      this.stage = stage;
+      this.stageDetail = detail;
+    },
+    remainingMs() {
+      return Math.max(1000, this.totalBudgetMs - (Date.now() - this.startedAt));
+    },
+    promise: null,
+  };
+
+  const masterTimer = setTimeout(() => {
+    job.timedOut = true;
+    const elapsedSec = roundSec((Date.now() - job.startedAt) / 1000, 1);
+    const timeoutErr = new PipelineExecutionError(
+      'PIPELINE_TIMEOUT',
+      `Extraction exceeded global ${Math.round(totalBudgetMs / 1000)}s timeout budget at stage "${job.stage}"${job.stageDetail ? ` (${job.stageDetail})` : ''}.`,
+      {
+        failed_stage: job.stage,
+        stage_detail: job.stageDetail || undefined,
+        elapsed_sec: elapsedSec,
+        timeout_budget_sec: Math.round(totalBudgetMs / 1000),
+        partial_files_cleaned: true,
+      }
+    );
+    abortController.abort(timeoutErr);
+  }, totalBudgetMs);
+  if (masterTimer.unref) masterTimer.unref();
+
+  job.promise = runExtractVideoInternal(options, resolved, baseOutputDir, job)
+    .then(
+      (res) => {
+        if (job.pendingCheckpointHandoff) {
+          recentCheckpointedResults.set(lockId, {
+            settledAt: Date.now(),
+            promise: Promise.resolve(res),
+          });
+        }
+        return res;
+      },
+      (err) => {
+        if (job.pendingCheckpointHandoff) {
+          const rejected = Promise.reject(err);
+          rejected.catch(() => {}); // Prevent unhandled rejection while awaiting follow-up poll
+          recentCheckpointedResults.set(lockId, {
+            settledAt: Date.now(),
+            promise: rejected,
+          });
+        }
+        throw err;
+      }
+    )
+    .finally(() => {
+      clearTimeout(masterTimer);
+      if (inFlightExtractions.get(lockId) === job) {
+        inFlightExtractions.delete(lockId);
+      }
+    });
+
+  // Prevent unhandled rejection if caller returns early at 45s checkpoint before job rejects
+  job.promise.catch(() => {});
+  inFlightExtractions.set(lockId, job);
+
+  return waitWithRpcCheckpoint(job, rpcWaitMs);
 }
 
 async function runExtractVideoInternal(
@@ -203,7 +389,8 @@ async function runExtractVideoInternal(
     force = false,
   },
   resolved,
-  baseOutputDir
+  baseOutputDir,
+  job
 ) {
   const { config } = loadEffectiveConfig();
   const effectiveProbeFps = probe_fps ?? config.sampling.probe_fps;
@@ -217,115 +404,123 @@ async function runExtractVideoInternal(
 
   let bundleId;
   let paths;
-  let metaInfo;
-  let videoPath;
-  let indexPayload;
+  let hadCompletedBundleBeforeRun = false;
 
-  // Pre-flight fast path before creating cache directories
   if (resolved.platform === 'local') {
     bundleId = `local_${resolved.videoId}`;
+    job.bundleId = bundleId;
     paths = getBundlePaths(baseOutputDir, bundleId);
-    if (!force && isBundleComplete(paths)) {
+    hadCompletedBundleBeforeRun = isBundleComplete(paths);
+    if (!force && hadCompletedBundleBeforeRun) {
       return buildPathsOnlyReturnPayload(paths);
     }
   } else if (resolved.platform === 'youtube') {
     bundleId = `youtube_${resolved.videoId}_p1`;
+    job.bundleId = bundleId;
     paths = getBundlePaths(baseOutputDir, bundleId);
-    if (!force && isBundleComplete(paths)) {
+    hadCompletedBundleBeforeRun = isBundleComplete(paths);
+    if (!force && hadCompletedBundleBeforeRun) {
       return buildPathsOnlyReturnPayload(paths);
     }
   }
 
+  let succeeded = false;
+
   try {
+    let videoPath;
+    let chapters = [];
+    let initialSegments = [];
+    let subtitleSource = 'none';
+    let title = '';
+    let author = '';
+    let description = '';
+    let sourceUrl = '';
+    let initialDurationSec = 0;
+    let videoIdOut = resolved.videoId;
+    let partOut = 1;
+    let multiPartNotice = null;
+    let asrTaskRunner = null;
+
     if (resolved.platform === 'local') {
-      const localProbe = await probeVideo(resolved.localPath);
+      job.setStage('probing_local_video');
+      const localProbe = await probeVideo(resolved.localPath, job.signal);
       if (!localProbe.hasVideo) {
         throw new Error(`Local file does not contain a valid video stream: "${resolved.localPath}"`);
       }
 
-      // Fast-fail config check before spending CPU transcoding if local video has an audio track
       const resolvedProvider = localProbe.hasAudio ? requireValidAsrProvider(config.asr) : null;
 
       await fs.promises.mkdir(paths.bundleDir, { recursive: true });
       await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
+      job.setStage('transcoding_local_video_360p');
       console.error(
         `[video-context] Compressing local video (${localProbe.width}x${localProbe.height}${localProbe.fps ? `@${Math.round(localProbe.fps)}fps` : ''}) to 360p@<=30fps cache stream for ${bundleId}...`
       );
       videoPath = await transcodeLocalVideoToCompactCache(resolved.localPath, paths.cacheDir, {
         targetShortSide: 360,
         maxFps: 30,
+        timeoutMs: job.remainingMs(),
+        signal: job.signal,
       });
 
-      // Step 1b: Audio ASR processing after video stream is prepared (skipped automatically if local file has no audio track)
-      let segments = [];
-      let subtitleSource = 'none';
+      title = resolved.fileName;
+      author = 'Local Video';
+      sourceUrl = resolved.canonicalUrl;
+      initialDurationSec = localProbe.durationSec;
+
       if (localProbe.hasAudio && resolvedProvider) {
-        const asrOut = await transcribeAudioMedia({
-          audioMediaPath: resolved.localPath,
-          cacheDir: paths.cacheDir,
-          asrConfig: config.asr,
-          resolvedProvider,
-        });
-        segments = asrOut.segments;
-        subtitleSource = `asr:${asrOut.providerName}`;
+        asrTaskRunner = async () => {
+          const asrOut = await transcribeAudioMedia({
+            audioMediaPath: resolved.localPath,
+            cacheDir: paths.cacheDir,
+            asrConfig: config.asr,
+            resolvedProvider,
+            timeoutMs: job.remainingMs(),
+            signal: job.signal,
+            onProgress: (detail) => job.setStage('cloud_asr', detail),
+          });
+          return {
+            segments: asrOut.segments,
+            subtitleSource: `asr:${asrOut.providerName}`,
+          };
+        };
       } else {
         console.error(`[video-context] Local video has no audio stream; skipping ASR.`);
       }
-
-      const transcriptMd = formatTranscriptMarkdown(segments, {
-        title: resolved.fileName,
-        author: 'Local Video',
-        platform: 'local',
-        durationSec: localProbe.durationSec,
-        sourceUrl: resolved.canonicalUrl,
-      });
-      await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
-
-      metaInfo = {
-        bundle_id: bundleId,
-        platform: 'local',
-        video_id: resolved.videoId,
-        part: 1,
-        multi_part_notice: null,
-        source_url: resolved.canonicalUrl,
-        title: resolved.fileName,
-        author: 'Local Video',
-        duration_sec: localProbe.durationSec,
-        has_subtitle: segments.length > 0,
-        subtitle_source: subtitleSource,
-        subtitle_segments: segments.length,
-        segments,
-      };
     } else if (resolved.platform === 'bilibili') {
+      job.setStage('authenticating_bilibili');
       const biliAuth = await ensureBilibiliAuth(allow_guest_degraded);
       const cookieHeader = biliAuth.cookie_header || '';
       const view = await fetchBilibiliView(resolved, cookieHeader, biliAuth.wbi_keys);
-      bundleId = `bilibili_${view.bvid}_p${view.part}`;
-      paths = getBundlePaths(baseOutputDir, bundleId);
 
-      if (!force && isBundleComplete(paths)) {
+      bundleId = `bilibili_${view.bvid}_p${view.part}`;
+      job.bundleId = bundleId;
+      paths = getBundlePaths(baseOutputDir, bundleId);
+      hadCompletedBundleBeforeRun = isBundleComplete(paths);
+      if (!force && hadCompletedBundleBeforeRun) {
         return buildPathsOnlyReturnPayload(paths);
       }
 
       await fs.promises.mkdir(paths.bundleDir, { recursive: true });
       await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
+      job.setStage('downloading_bilibili_video_and_subtitles');
       console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
 
       const fetchSubsTask = (async () => {
-        let { chapters, subtitleTrack, segments } = await fetchBilibiliSubtitlesAndChapters(
+        let subRes = await fetchBilibiliSubtitlesAndChapters(
           view.bvid,
           view.cid,
           cookieHeader,
           biliAuth.wbi_keys
         );
 
-        if (segments.length === 0) {
+        if (subRes.segments.length === 0) {
           const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
           try {
             await withTempBilibiliCookieFile(paths.cacheDir, async (tmpCookiePath) => {
-              const info = await dumpYtDlpInfo('bilibili', view.canonicalUrl, tmpCookiePath);
+              const info = await dumpYtDlpInfo('bilibili', view.canonicalUrl, tmpCookiePath, job.signal);
               const ytSub = await extractSubtitlesFromYtDlpInfo(
                 info,
                 'bilibili',
@@ -334,17 +529,20 @@ async function runExtractVideoInternal(
                 tempSubDir
               );
               if (ytSub.segments.length > 0) {
-                subtitleTrack = ytSub.subtitleTrack;
-                segments = ytSub.segments;
+                subRes = {
+                  chapters: subRes.chapters,
+                  subtitleTrack: ytSub.subtitleTrack,
+                  segments: ytSub.segments,
+                };
               }
             });
-          } catch {
-            // ignore fallback error
+          } catch (err) {
+            if (job.signal.aborted) throw err;
           } finally {
             await fs.promises.rm(tempSubDir, { recursive: true, force: true });
           }
         }
-        return { chapters, subtitleTrack, segments };
+        return subRes;
       })();
 
       const fetchVideoTask = (async () => {
@@ -356,8 +554,10 @@ async function runExtractVideoInternal(
             cookieHeader,
             wbiKeys: biliAuth.wbi_keys,
             targetShortSide,
+            signal: job.signal,
           });
         } catch (err) {
+          if (job.signal.aborted) throw err;
           console.error(
             `[video-context] Direct DASH mirror failed (${err.message}); falling back to yt-dlp...`
           );
@@ -368,94 +568,94 @@ async function runExtractVideoInternal(
               cacheDir: paths.cacheDir,
               cookieFilePath: tmpCookiePath,
               targetShortSide,
+              signal: job.signal,
             })
           );
         }
       })();
 
-      let [{ chapters, subtitleTrack, segments }, downloadedVideoPath] = await Promise.all([
+      const [subResult, downloadedVideoPath] = await Promise.all([
         fetchSubsTask,
         fetchVideoTask,
       ]);
+
       videoPath = downloadedVideoPath;
-      let subtitleSource = subtitleTrack?.source_type || (segments.length > 0 ? 'native' : 'none');
+      chapters = subResult.chapters;
+      initialSegments = subResult.segments;
+      subtitleSource =
+        subResult.subtitleTrack?.source_type || (initialSegments.length > 0 ? 'native' : 'none');
+      title = view.title;
+      author = view.author;
+      description = view.description;
+      sourceUrl = view.canonicalUrl;
+      initialDurationSec = view.duration_sec;
+      videoIdOut = view.bvid;
+      partOut = view.part;
+      multiPartNotice =
+        view.pages.length > 1 && !resolved.partExplicit
+          ? `This video has ${view.pages.length} parts. Defaulted to P1 ("${view.partTitle}"). Pass part=N for other parts.`
+          : null;
 
-      // Step 1b: ONLY when native/AI subtitles are absent after video stream is downloaded -> run audio ASR
-      if (segments.length === 0) {
-        let audioPath = null;
-        try {
-          audioPath = await downloadBilibiliDashAudio({
-            bvid: view.bvid,
-            cid: view.cid,
-            destDir: paths.cacheDir,
-            cookieHeader,
-            wbiKeys: biliAuth.wbi_keys,
-            preferredAudioKbps: 96,
-          });
-        } catch (err) {
-          console.error(
-            `[video-context] Direct DASH audio mirror failed (${err.message}); falling back to yt-dlp...`
-          );
-          audioPath = await withTempBilibiliCookieFile(paths.cacheDir, (tmpCookiePath) =>
-            ensureCachedAudioStream({
-              platform: 'bilibili',
-              canonicalUrl: view.canonicalUrl,
-              cacheDir: paths.cacheDir,
-              cookieFilePath: tmpCookiePath,
+      if (initialSegments.length === 0) {
+        asrTaskRunner = async () => {
+          job.setStage('downloading_bilibili_audio');
+          let audioPath = null;
+          try {
+            audioPath = await downloadBilibiliDashAudio({
+              bvid: view.bvid,
+              cid: view.cid,
+              destDir: paths.cacheDir,
+              cookieHeader,
+              wbiKeys: biliAuth.wbi_keys,
               preferredAudioKbps: 96,
-            })
-          );
-        }
+              signal: job.signal,
+            });
+          } catch (err) {
+            if (job.signal.aborted) throw err;
+            console.error(
+              `[video-context] Direct DASH audio mirror failed (${err.message}); falling back to yt-dlp...`
+            );
+            audioPath = await withTempBilibiliCookieFile(paths.cacheDir, (tmpCookiePath) =>
+              ensureCachedAudioStream({
+                platform: 'bilibili',
+                canonicalUrl: view.canonicalUrl,
+                cacheDir: paths.cacheDir,
+                cookieFilePath: tmpCookiePath,
+                preferredAudioKbps: 96,
+                signal: job.signal,
+              })
+            );
+          }
 
-        if (audioPath && (await probeAudioStream(audioPath))) {
+          if (!audioPath || !(await probeAudioStream(audioPath, job.signal))) {
+            return { segments: [], subtitleSource: 'none' };
+          }
+
           const resolvedProvider = requireValidAsrProvider(config.asr);
           const asrOut = await transcribeAudioMedia({
             audioMediaPath: audioPath,
             cacheDir: paths.cacheDir,
             asrConfig: config.asr,
             resolvedProvider,
+            timeoutMs: job.remainingMs(),
+            signal: job.signal,
+            onProgress: (detail) => job.setStage('cloud_asr', detail),
           });
-          segments = asrOut.segments;
-          subtitleSource = `asr:${asrOut.providerName}`;
-        }
+          return {
+            segments: asrOut.segments,
+            subtitleSource: `asr:${asrOut.providerName}`,
+          };
+        };
       }
-
-      const transcriptMd = formatTranscriptMarkdown(segments, {
-        title: view.title,
-        author: view.author,
-        platform: 'bilibili',
-        durationSec: view.duration_sec,
-        description: view.description,
-        chapters,
-        sourceUrl: view.canonicalUrl,
-      });
-      await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
-
-      metaInfo = {
-        bundle_id: bundleId,
-        platform: 'bilibili',
-        video_id: view.bvid,
-        part: view.part,
-        multi_part_notice:
-          view.pages.length > 1 && !resolved.partExplicit
-            ? `This video has ${view.pages.length} parts. Defaulted to P1 ("${view.partTitle}"). Pass part=N for other parts.`
-            : null,
-        source_url: view.canonicalUrl,
-        title: view.title,
-        author: view.author,
-        duration_sec: view.duration_sec,
-        has_subtitle: segments.length > 0,
-        subtitle_source: subtitleSource,
-        subtitle_segments: segments.length,
-        segments,
-      };
     } else {
       await fs.promises.mkdir(paths.bundleDir, { recursive: true });
       await fs.promises.mkdir(paths.cacheDir, { recursive: true });
 
+      job.setStage('resolving_youtube_metadata');
       console.error(`[video-context] Resolving YouTube metadata for ${bundleId}...`);
-      const info = await dumpYtDlpInfo('youtube', resolved.canonicalUrl, null);
+      const info = await dumpYtDlpInfo('youtube', resolved.canonicalUrl, null, job.signal);
 
+      job.setStage('downloading_youtube_video_and_subtitles');
       console.error(`[video-context] Fetching subtitles & compact stream concurrently for ${bundleId}...`);
       const tempSubDir = path.join(paths.cacheDir, 'tmp_subs');
       const fetchSubsTask = extractSubtitlesFromYtDlpInfo(
@@ -473,100 +673,90 @@ async function runExtractVideoInternal(
         cookieFilePath: null,
         info,
         targetShortSide,
+        signal: job.signal,
       });
 
-      let [{ subtitleTrack, segments }, downloadedVideoPath] = await Promise.all([
+      const [subResult, downloadedVideoPath] = await Promise.all([
         fetchSubsTask,
         fetchVideoTask,
       ]);
+
       videoPath = downloadedVideoPath;
-      let subtitleSource = subtitleTrack?.source_type || (segments.length > 0 ? 'native' : 'none');
-
-      // Step 1b: ONLY when YouTube subtitles are absent after video stream is downloaded -> run audio ASR
-      if (segments.length === 0) {
-        const hasAudioInFormats =
-          !Array.isArray(info.formats) ||
-          info.formats.some((f) => f && f.acodec && f.acodec !== 'none');
-
-        if (hasAudioInFormats) {
-          const resolvedProvider = requireValidAsrProvider(config.asr);
-          const audioPath = await ensureCachedAudioStream({
-            platform: 'youtube',
-            canonicalUrl: resolved.canonicalUrl,
-            cacheDir: paths.cacheDir,
-            cookieFilePath: null,
-            info,
-            preferredAudioKbps: 96,
-          });
-          if (audioPath && (await probeAudioStream(audioPath))) {
-            const asrOut = await transcribeAudioMedia({
-              audioMediaPath: audioPath,
-              cacheDir: paths.cacheDir,
-              asrConfig: config.asr,
-              resolvedProvider,
-            });
-            segments = asrOut.segments;
-            subtitleSource = `asr:${asrOut.providerName}`;
-          }
-        }
-      }
-
-      const chapters = Array.isArray(info.chapters)
+      initialSegments = subResult.segments;
+      subtitleSource =
+        subResult.subtitleTrack?.source_type || (initialSegments.length > 0 ? 'native' : 'none');
+      chapters = Array.isArray(info.chapters)
         ? info.chapters.map((ch) => ({
             title: ch.title || '',
             start_sec: roundSec(Number(ch.start_time || 0), 2),
             end_sec: roundSec(Number(ch.end_time || 0), 2),
           }))
         : [];
+      title = info.title || resolved.videoId;
+      author = info.uploader || info.channel || 'Unknown';
+      initialDurationSec = Number(info.duration || 0);
+      description = info.description || '';
+      sourceUrl = resolved.canonicalUrl;
 
-      const title = info.title || resolved.videoId;
-      const author = info.uploader || info.channel || 'Unknown';
-      const durationSec = Number(info.duration || 0);
+      if (initialSegments.length === 0) {
+        const hasAudioInFormats =
+          !Array.isArray(info.formats) ||
+          info.formats.some((f) => f && f.acodec && f.acodec !== 'none');
 
-      const transcriptMd = formatTranscriptMarkdown(segments, {
-        title,
-        author,
-        platform: 'youtube',
-        durationSec,
-        description: info.description || '',
-        chapters,
-        sourceUrl: resolved.canonicalUrl,
-      });
-      await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
-
-      metaInfo = {
-        bundle_id: bundleId,
-        platform: 'youtube',
-        video_id: resolved.videoId,
-        part: 1,
-        multi_part_notice: null,
-        source_url: resolved.canonicalUrl,
-        title,
-        author,
-        duration_sec: durationSec,
-        has_subtitle: segments.length > 0,
-        subtitle_source: subtitleSource,
-        subtitle_segments: segments.length,
-        segments,
-      };
+        if (hasAudioInFormats) {
+          const resolvedProvider = requireValidAsrProvider(config.asr);
+          asrTaskRunner = async () => {
+            job.setStage('downloading_youtube_audio');
+            const audioPath = await ensureCachedAudioStream({
+              platform: 'youtube',
+              canonicalUrl: resolved.canonicalUrl,
+              cacheDir: paths.cacheDir,
+              cookieFilePath: null,
+              info,
+              preferredAudioKbps: 96,
+              signal: job.signal,
+            });
+            if (!audioPath || !(await probeAudioStream(audioPath, job.signal))) {
+              return { segments: [], subtitleSource: 'none' };
+            }
+            const asrOut = await transcribeAudioMedia({
+              audioMediaPath: audioPath,
+              cacheDir: paths.cacheDir,
+              asrConfig: config.asr,
+              resolvedProvider,
+              timeoutMs: job.remainingMs(),
+              signal: job.signal,
+              onProgress: (detail) => job.setStage('cloud_asr', detail),
+            });
+            return {
+              segments: asrOut.segments,
+              subtitleSource: `asr:${asrOut.providerName}`,
+            };
+          };
+        }
+      }
     }
 
-    // Step 2: Single-pass multi-threaded FFmpeg stream (Two-Gate + Cap + in-memory JPEG capture)
-    const probe = await probeVideo(videoPath);
-    const durationSec = probe.durationSec || metaInfo.duration_sec || 10;
-    metaInfo.duration_sec = durationSec;
-    const cellW = config.grid.cell_width || 640;
-    const cellH = config.grid.cell_height || 360;
+    // Step 2: Run [Orientation-aware Single-Pass Video Scan] and [Audio ASR (if needed)] IN PARALLEL!
+    const probe = await probeVideo(videoPath, job.signal);
+    const durationSec = probe.durationSec || initialDurationSec || 10;
+    const gridSpec = resolveOrientationAwareGridSpec(probe.width, probe.height);
+    const cellW = gridSpec.cellWidth;
+    const cellH = gridSpec.cellHeight;
 
     console.error(
-      `[video-context] Stream ready (${probe.width}x${probe.height}, ${Math.round(durationSec)}s). Running single-pass Two-Gate scan (${effectiveProbeFps} fps)...`
+      `[video-context] Stream ready (${probe.width}x${probe.height} [${gridSpec.orientation}], ${Math.round(durationSec)}s). Running Two-Gate scan (${gridSpec.cols}x${gridSpec.rows} @ ${cellW}x${cellH})${asrTaskRunner ? ' + parallel cloud ASR' : ''}...`
     );
 
+    if (!asrTaskRunner) {
+      job.setStage('scanning_video_frames');
+    }
+
     const tracker = createTwoGateTracker({
-      width: 160,
-      height: 90,
-      tileCols: 8,
-      tileRows: 6,
+      width: gridSpec.probeWidth,
+      height: gridSpec.probeHeight,
+      tileCols: gridSpec.tileCols,
+      tileRows: gridSpec.tileRows,
       diffThreshold: effectiveDiffThreshold,
       settleThreshold: effectiveSettleThreshold,
       minIntervalSec: effectiveMinInterval,
@@ -574,17 +764,47 @@ async function runExtractVideoInternal(
       onEmit: (rgbBuf) => encodeRgbCandidateToJpeg(rgbBuf, cellW, cellH, 88),
     });
 
-    await scanSinglePassVideoStream(videoPath, tracker, {
+    const visualScanPromise = scanSinglePassVideoStream(videoPath, tracker, {
       probeFps: effectiveProbeFps,
       cellWidth: cellW,
       cellHeight: cellH,
+      probeWidth: gridSpec.probeWidth,
+      probeHeight: gridSpec.probeHeight,
+      timeoutMs: job.remainingMs(),
+      signal: job.signal,
+    }).catch((err) => {
+      if (!job.signal.aborted) job.abortController.abort(err);
+      throw err;
     });
 
+    const asrPromise = asrTaskRunner
+      ? asrTaskRunner().catch((err) => {
+          if (!job.signal.aborted) job.abortController.abort(err);
+          throw err;
+        })
+      : Promise.resolve({ segments: initialSegments, subtitleSource });
+
+    const [, asrResolved] = await Promise.all([visualScanPromise, asrPromise]);
+    const finalSegments = asrResolved.segments;
+    const finalSubtitleSource = asrResolved.subtitleSource;
+
+    const transcriptMd = formatTranscriptMarkdown(finalSegments, {
+      title,
+      author,
+      platform: resolved.platform,
+      durationSec,
+      description,
+      chapters,
+      sourceUrl,
+    });
+    await fs.promises.writeFile(paths.transcriptPath, transcriptMd, 'utf8');
+
+    job.setStage('composing_grids');
     const rawCandidates = tracker.flush();
     const rawCandidatesCount = rawCandidates.length;
     const samplePoints = finalizeSamplePlan({
       rawCandidates,
-      subtitleSegments: metaInfo.segments,
+      subtitleSegments: finalSegments,
       durationSec,
       minIntervalSec: effectiveMinInterval,
       maxIntervalSec: effectiveMaxInterval,
@@ -598,9 +818,9 @@ async function runExtractVideoInternal(
       }
     }
 
-    const perGrid = config.grid.cols * config.grid.rows;
+    const perGrid = gridSpec.cols * gridSpec.rows;
     console.error(
-      `[video-context] Selected ${samplePoints.length} settled frames (from ${rawCandidatesCount} raw visual changes) -> composing ${Math.ceil(samplePoints.length / perGrid)} ${config.grid.rows}x${config.grid.cols} grids...`
+      `[video-context] Selected ${samplePoints.length} settled frames (from ${rawCandidatesCount} raw visual changes) -> composing ${Math.ceil(samplePoints.length / perGrid)} ${gridSpec.cols}x${gridSpec.rows} (${gridSpec.orientation}) grids...`
     );
 
     await fs.promises.rm(paths.gridsDir, { recursive: true, force: true });
@@ -616,6 +836,7 @@ async function runExtractVideoInternal(
 
     const missing = extractedFrames.filter((f) => !f.frameBuffer);
     const tempFramesDir = path.join(paths.cacheDir, 'tmp_frames');
+    let indexPayload;
     try {
       if (missing.length > 0) {
         const recovered = await extractLanczosFrames({
@@ -624,6 +845,7 @@ async function runExtractVideoInternal(
           tempFramesDir,
           cellWidth: cellW,
           cellHeight: cellH,
+          signal: job.signal,
         });
         const recMap = new Map(recovered.map((r) => [r.frameNo, r.framePath]));
         extractedFrames = extractedFrames.map((f) =>
@@ -636,6 +858,8 @@ async function runExtractVideoInternal(
         gridsDir: paths.gridsDir,
         relativeDirPrefix: 'grids',
         sourceStreamHeight: Math.min(probe.width || 0, probe.height || 0) || probe.height,
+        spec: gridSpec,
+        signal: job.signal,
       });
       indexPayload = composed.indexPayload;
     } finally {
@@ -643,30 +867,76 @@ async function runExtractVideoInternal(
         await fs.promises.rm(tempFramesDir, { recursive: true, force: true });
       }
     }
+
+    await Promise.all([
+      fs.promises.rm(path.join(paths.bundleDir, 'sprites'), { recursive: true, force: true }),
+      fs.promises.rm(path.join(paths.bundleDir, 'subtitles'), { recursive: true, force: true }),
+      fs.promises.rm(path.join(paths.bundleDir, 'frames_index.json'), { force: true }),
+    ]);
+
+    const manifest = {
+      bundle_id: bundleId,
+      platform: resolved.platform,
+      video_id: videoIdOut,
+      part: partOut,
+      multi_part_notice: multiPartNotice,
+      source_url: sourceUrl,
+      title,
+      author,
+      duration_sec: roundSec(durationSec, 2),
+      orientation: gridSpec.orientation,
+      grid_layout: [gridSpec.rows, gridSpec.cols],
+      cell_content_size: [cellW, cellH],
+      has_subtitle: finalSegments.length > 0,
+      subtitle_source: finalSubtitleSource,
+      subtitle_segments: finalSegments.length,
+      total_frames: indexPayload.total_frames,
+      total_grids: indexPayload.total_grids,
+      grid_files: (indexPayload.grids || []).map((g) => g.file),
+      completed: true,
+    };
+
+    await fs.promises.writeFile(paths.manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+    succeeded = true;
+    return buildPathsOnlyReturnPayload(paths);
+  } catch (err) {
+    if (!job.signal.aborted) {
+      job.abortController.abort(err);
+    }
+
+    // Remove incomplete bundle artifacts if this was not an already-valid prior bundle
+    if (paths?.bundleDir && !hadCompletedBundleBeforeRun) {
+      await fs.promises.rm(paths.bundleDir, { recursive: true, force: true }).catch(() => {});
+    }
+
+    if (
+      err instanceof AuthRequiredError ||
+      err instanceof AsrConfigRequiredError ||
+      err instanceof PipelineExecutionError
+    ) {
+      throw err;
+    }
+
+    if (job.timedOut && job.signal.reason instanceof PipelineExecutionError) {
+      throw job.signal.reason;
+    }
+
+    const elapsedSec = roundSec((Date.now() - job.startedAt) / 1000, 1);
+    throw new PipelineExecutionError(
+      'EXECUTION_ERROR',
+      err?.message || String(err),
+      {
+        failed_stage: job.stage,
+        stage_detail: job.stageDetail || undefined,
+        elapsed_sec: elapsedSec,
+        partial_files_cleaned: !hadCompletedBundleBeforeRun,
+      }
+    );
   } finally {
-    if (!keepVideoCache && paths?.cacheDir) {
-      await fs.promises.rm(paths.cacheDir, { recursive: true, force: true });
+    if ((!keepVideoCache || !succeeded) && paths?.cacheDir) {
+      await fs.promises.rm(paths.cacheDir, { recursive: true, force: true }).catch(() => {});
     }
   }
-
-  await Promise.all([
-    fs.promises.rm(path.join(paths.bundleDir, 'sprites'), { recursive: true, force: true }),
-    fs.promises.rm(path.join(paths.bundleDir, 'subtitles'), { recursive: true, force: true }),
-    fs.promises.rm(path.join(paths.bundleDir, 'frames_index.json'), { force: true }),
-  ]);
-
-  const { segments: _omitSegments, ...manifestBody } = metaInfo;
-  const manifest = {
-    ...manifestBody,
-    duration_sec: roundSec(metaInfo.duration_sec, 2),
-    total_frames: indexPayload.total_frames,
-    total_grids: indexPayload.total_grids,
-    grid_files: (indexPayload.grids || []).map((g) => g.file),
-    completed: true,
-  };
-
-  await fs.promises.writeFile(paths.manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
-  return buildPathsOnlyReturnPayload(paths);
 }
 
 function isBundleComplete(paths) {
@@ -686,6 +956,7 @@ async function buildPathsOnlyReturnPayload(paths) {
   const gridFiles = (manifest.grid_files || []).map((rel) => path.join(paths.bundleDir, rel));
 
   return {
+    completed: true,
     bundle_id: manifest.bundle_id,
     platform: manifest.platform,
     video_id: manifest.video_id,
@@ -694,6 +965,7 @@ async function buildPathsOnlyReturnPayload(paths) {
     title: manifest.title,
     author: manifest.author,
     duration_sec: manifest.duration_sec,
+    orientation: manifest.orientation || 'landscape',
     has_subtitle: Boolean(manifest.has_subtitle),
     subtitle_segments: manifest.subtitle_segments || 0,
     total_frames: manifest.total_frames,

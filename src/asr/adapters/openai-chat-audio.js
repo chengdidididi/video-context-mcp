@@ -8,8 +8,9 @@ export async function transcribeChunkOpenAiChatAudio({
   providerCfg,
   language = 'auto',
   prompt = '',
-  timeoutMs = 60_000,
+  timeoutMs = 300_000,
   maxRetries = 2,
+  signal = null,
 }) {
   const baseUrl = String(providerCfg.base_url || 'https://api.xiaomimimo.com/v1').replace(/\/+$/, '');
   const endpointPath = String(providerCfg.endpoint_path || '/chat/completions');
@@ -84,6 +85,7 @@ export async function transcribeChunkOpenAiChatAudio({
         timeoutMs,
         maxRetries,
         label: `openai-chat-audio(${model})`,
+        signal,
       }
     );
   };

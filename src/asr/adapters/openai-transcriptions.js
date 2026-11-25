@@ -8,8 +8,9 @@ export async function transcribeChunkOpenAiTranscriptions({
   providerCfg,
   language = 'auto',
   prompt = '',
-  timeoutMs = 60_000,
+  timeoutMs = 300_000,
   maxRetries = 2,
+  signal = null,
 }) {
   const baseUrl = String(providerCfg.base_url || 'https://api.siliconflow.cn/v1').replace(/\/+$/, '');
   const endpointPath = String(providerCfg.endpoint_path || '/audio/transcriptions');
@@ -52,6 +53,7 @@ export async function transcribeChunkOpenAiTranscriptions({
         timeoutMs,
         maxRetries,
         label: `openai-transcriptions(${model})`,
+        signal,
       }
     );
 

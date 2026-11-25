@@ -123,7 +123,14 @@ export async function writeTempNetscapeCookieFile(rawConfigValue, destPath, defa
 }
 
 export async function fetchWithContext(url, options = {}) {
-  const { platform, cookieHeader, headers = {}, redirect = 'follow', timeoutMs = 20_000 } = options;
+  const {
+    platform,
+    cookieHeader,
+    headers = {},
+    redirect = 'follow',
+    timeoutMs = getTimeoutMs(),
+    signal: parentSignal = null,
+  } = options;
   const finalHeaders = {
     'User-Agent': USER_AGENT,
     Accept: 'application/json, text/plain, */*',
@@ -137,17 +144,45 @@ export async function fetchWithContext(url, options = {}) {
     finalHeaders.Cookie = cookieHeader;
   }
 
+  if (parentSignal?.aborted) {
+    throw parentSignal.reason || new Error(`HTTP request aborted before start: ${url}`);
+  }
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const onParentAbort = () => {
+    controller.abort(parentSignal.reason || new Error(`HTTP request interrupted: ${url}`));
+  };
+  if (parentSignal) {
+    parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(`HTTP request timed out after ${Math.round(timeoutMs / 1000)}s: ${url}`));
+  }, timeoutMs);
+
   try {
+    const { signal: _omit, ...restOptions } = options;
     return await fetch(url, {
-      ...options,
+      ...restOptions,
       headers: finalHeaders,
       redirect,
       signal: controller.signal,
     });
+  } catch (err) {
+    if (parentSignal?.aborted) {
+      throw parentSignal.reason || new Error(`HTTP request interrupted by pipeline abort: ${url}`);
+    }
+    if (timedOut) {
+      throw new Error(`HTTP request timed out after ${Math.round(timeoutMs / 1000)}s: ${url}`);
+    }
+    throw new Error(`Network request failed for ${url}: ${err?.message || String(err)}`);
   } finally {
     clearTimeout(timer);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
   }
 }
 
@@ -158,7 +193,8 @@ export async function downloadFile(url, destPath, options = {}) {
     cookieHeader,
     headers = {},
     timeoutMs = getTimeoutMs(),
-    stallTimeoutMs = 30_000,
+    stallTimeoutMs = 45_000,
+    signal: parentSignal = null,
   } = options;
 
   const finalHeaders = {
@@ -173,16 +209,27 @@ export async function downloadFile(url, destPath, options = {}) {
     finalHeaders.Cookie = cookieHeader;
   }
 
+  if (parentSignal?.aborted) {
+    throw parentSignal.reason || new Error(`Download aborted before start: ${fullUrl}`);
+  }
+
   const controller = new AbortController();
-  const headerTimer = setTimeout(
-    () => controller.abort(new Error(`Connection header timeout (${timeoutMs}ms)`)),
-    Math.min(timeoutMs, 30_000)
+  const onParentAbort = () => {
+    controller.abort(parentSignal.reason || new Error(`Download interrupted: ${fullUrl}`));
+  };
+  if (parentSignal) {
+    parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+
+  const totalTimer = setTimeout(
+    () => controller.abort(new Error(`Download timed out after ${Math.round(timeoutMs / 1000)}s: ${fullUrl}`)),
+    timeoutMs
   );
   let stallTimer = null;
   const resetStallTimer = () => {
     if (stallTimer) clearTimeout(stallTimer);
     stallTimer = setTimeout(
-      () => controller.abort(new Error(`Stream stalled for ${stallTimeoutMs}ms`)),
+      () => controller.abort(new Error(`Stream stalled with zero bytes for ${Math.round(stallTimeoutMs / 1000)}s: ${fullUrl}`)),
       stallTimeoutMs
     );
   };
@@ -194,7 +241,6 @@ export async function downloadFile(url, destPath, options = {}) {
       redirect: 'follow',
       signal: controller.signal,
     });
-    clearTimeout(headerTimer);
 
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} downloading ${fullUrl}`);
@@ -225,8 +271,19 @@ export async function downloadFile(url, destPath, options = {}) {
     const fileStream = fs.createWriteStream(destPath);
     await pipeline(nodeStream, fileStream, { signal: controller.signal });
     return destPath;
+  } catch (err) {
+    if (parentSignal?.aborted) {
+      throw parentSignal.reason || new Error(`Download interrupted by pipeline abort: ${fullUrl}`);
+    }
+    if (controller.signal.aborted && controller.signal.reason instanceof Error) {
+      throw controller.signal.reason;
+    }
+    throw err;
   } finally {
-    clearTimeout(headerTimer);
+    clearTimeout(totalTimer);
     if (stallTimer) clearTimeout(stallTimer);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
   }
 }

@@ -8,7 +8,7 @@ import { formatSlugTimestamp, roundSec } from '../utils/time.js';
  * Probe audio stream metadata and total duration via ffprobe.
  * Returns null if the media container physically has no audio stream (e.g. silent screen recording).
  */
-export async function probeAudioStream(mediaPath) {
+export async function probeAudioStream(mediaPath, signal = null) {
   const ffprobe = resolveBinary('ffprobe');
   const args = [
     '-v',
@@ -22,7 +22,7 @@ export async function probeAudioStream(mediaPath) {
     mediaPath,
   ];
 
-  const { stdout } = await runCommand(ffprobe, args, { timeoutMs: 20_000 });
+  const { stdout } = await runCommand(ffprobe, args, { timeoutMs: getTimeoutMs(), signal });
   const parsed = JSON.parse(stdout);
   const stream = parsed.streams?.[0];
   const format = parsed.format || {};
@@ -81,7 +81,7 @@ export function resolveAdaptiveChunkSpec(providerCfg = {}, userChunkOverrides = 
 /**
  * Normalize raw audio/video container into compact speech-ready mono 16kHz MP3 (or WAV).
  */
-export async function normalizeAudioForAsr(sourceMediaPath, cacheDir, audioCfg = {}) {
+export async function normalizeAudioForAsr(sourceMediaPath, cacheDir, audioCfg = {}, signal = null) {
   await fs.promises.mkdir(cacheDir, { recursive: true });
   const sampleRate = Number(audioCfg.sample_rate || 16000);
   const channels = Number(audioCfg.channels || 1);
@@ -127,8 +127,8 @@ export async function normalizeAudioForAsr(sourceMediaPath, cacheDir, audioCfg =
     outPath,
   ];
 
-  await runCommand(ffmpeg, args, { timeoutMs: getTimeoutMs() });
-  const probe = await probeAudioStream(outPath);
+  await runCommand(ffmpeg, args, { timeoutMs: getTimeoutMs(), signal });
+  const probe = await probeAudioStream(outPath, signal);
   if (!probe) {
     throw new Error(`Normalized audio file produced no readable audio stream: ${outPath}`);
   }
@@ -146,7 +146,7 @@ export async function normalizeAudioForAsr(sourceMediaPath, cacheDir, audioCfg =
  * Detect speech pause intervals using vocal-bandpass (200Hz–3000Hz) + silencedetect
  * so heavy bass BGM or high-frequency hiss does not mask natural speaker breaths.
  */
-export async function detectSilenceIntervals(audioPath, durationSec, chunkSpec = {}) {
+export async function detectSilenceIntervals(audioPath, durationSec, chunkSpec = {}, signal = null) {
   const ffmpeg = resolveBinary('ffmpeg');
   const noiseDb = Number(chunkSpec.silence_noise_db ?? -28);
   const minSilenceDur = Math.max(0.15, Number(chunkSpec.silence_min_duration_sec ?? 0.25));
@@ -166,6 +166,7 @@ export async function detectSilenceIntervals(audioPath, durationSec, chunkSpec =
   const { stderr } = await runCommand(ffmpeg, args, {
     timeoutMs: getTimeoutMs(),
     allowNonZero: true,
+    signal,
   });
 
   const silences = [];
@@ -310,11 +311,11 @@ export function planSpeechChunks(durationSec, silences = [], chunkSpec = {}) {
 /**
  * Normalize and slice audio into self-contained speech chunks inside cache/asr_chunks/.
  */
-export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, providerCfg) {
+export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, providerCfg, signal = null) {
   const audioCfg = asrConfig.audio || {};
   const chunkSpec = resolveAdaptiveChunkSpec(providerCfg, asrConfig.chunking);
 
-  const norm = await normalizeAudioForAsr(sourceMediaPath, cacheDir, audioCfg);
+  const norm = await normalizeAudioForAsr(sourceMediaPath, cacheDir, audioCfg, signal);
   const maxDur = Number(asrConfig.max_duration_sec || 7200);
   if (norm.durationSec > maxDur) {
     throw new Error(
@@ -326,7 +327,7 @@ export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, p
   await fs.promises.rm(chunksDir, { recursive: true, force: true });
   await fs.promises.mkdir(chunksDir, { recursive: true });
 
-  const silences = await detectSilenceIntervals(norm.normalizedPath, norm.durationSec, chunkSpec);
+  const silences = await detectSilenceIntervals(norm.normalizedPath, norm.durationSec, chunkSpec, signal);
   const planned = planSpeechChunks(norm.durationSec, silences, chunkSpec);
 
   const ffmpeg = resolveBinary('ffmpeg');
@@ -338,44 +339,49 @@ export async function prepareAudioChunks(sourceMediaPath, cacheDir, asrConfig, p
       ? ['-c:a', 'pcm_s16le']
       : ['-c:a', 'libmp3lame', '-b:a', bitrate];
 
-  const materialized = await mapWithConcurrency(planned, 6, async (chunk) => {
-    const slug = `${formatSlugTimestamp(chunk.startSec)}-${formatSlugTimestamp(chunk.endSec)}`;
-    const fileName = `chunk_${String(chunk.index).padStart(4, '0')}_${slug}.${norm.codec}`;
-    const filePath = path.join(chunksDir, fileName);
+  const materialized = await mapWithConcurrency(
+    planned,
+    6,
+    async (chunk) => {
+      const slug = `${formatSlugTimestamp(chunk.startSec)}-${formatSlugTimestamp(chunk.endSec)}`;
+      const fileName = `chunk_${String(chunk.index).padStart(4, '0')}_${slug}.${norm.codec}`;
+      const filePath = path.join(chunksDir, fileName);
 
-    const args = [
-      '-nostdin',
-      '-hide_banner',
-      '-loglevel',
-      'error',
-      '-y',
-      '-ss',
-      String(chunk.startSec),
-      '-t',
-      String(chunk.durationSec),
-      '-i',
-      norm.normalizedPath,
-      '-vn',
-      '-ac',
-      String(channels),
-      '-ar',
-      String(sampleRate),
-      ...codecArgs,
-      filePath,
-    ];
+      const args = [
+        '-nostdin',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-ss',
+        String(chunk.startSec),
+        '-t',
+        String(chunk.durationSec),
+        '-i',
+        norm.normalizedPath,
+        '-vn',
+        '-ac',
+        String(channels),
+        '-ar',
+        String(sampleRate),
+        ...codecArgs,
+        filePath,
+      ];
 
-    await runCommand(ffmpeg, args, { timeoutMs: 30_000 });
-    const sizeBytes = fs.statSync(filePath).size;
+      await runCommand(ffmpeg, args, { timeoutMs: getTimeoutMs(), signal });
+      const sizeBytes = fs.statSync(filePath).size;
 
-    return {
-      ...chunk,
-      fileName,
-      filePath,
-      sizeBytes,
-      codec: norm.codec,
-      mimeType: norm.mimeType,
-    };
-  });
+      return {
+        ...chunk,
+        fileName,
+        filePath,
+        sizeBytes,
+        codec: norm.codec,
+        mimeType: norm.mimeType,
+      };
+    },
+    signal
+  );
 
   return {
     normalizedAudioPath: norm.normalizedPath,

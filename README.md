@@ -98,7 +98,8 @@ magpie library mcp add video-context --local timeout=300 \
 | :--- | :--- | :---: | :--- |
 | `output.dir` | `VIDEO_CONTEXT_OUTPUT_DIR` | `"./output"` | 产物统一输出根目录（`npx` 远程模式默认 `~/video-context-output`） |
 | `output.keep_video_cache` | `VIDEO_CONTEXT_KEEP_VIDEO_CACHE` | `false` | 拼图合成后是否保留 `cache/` 下的临时原视频流（默认 `false` 用完即焚，零原片磁盘残留） |
-| `runtime.timeout_sec` | `VIDEO_CONTEXT_TIMEOUT_SEC` | `300` | 下载与媒体处理的全局单任务超时上限（秒，默认 5 分钟；执行期间每 5s 发送 MCP `notifications/progress` 心跳保活） |
+| `runtime.timeout_sec` | `VIDEO_CONTEXT_TIMEOUT_SEC` | `300` | 全局统一后台总超时预算（秒，默认 5 分钟；超时或异常时自动强杀子进程、清空残缺缓存并返回结构化终态错误） |
+| `runtime.rpc_wait_sec` | `VIDEO_CONTEXT_RPC_WAIT_SEC` | `45` | 单次 MCP 调用主动检查点回执窗口（秒，早于网关 50s 硬截断返回 `RUNNING_IN_BACKGROUND` 引导续接） |
 | `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
 | `auth.allow_guest_degraded` | `VIDEO_CONTEXT_ALLOW_GUEST` | `false` | 未配 B 站 Cookie 时是否允许降级为 360p 无 AI 字幕游客模式 |
 | `asr.provider` | `VIDEO_CONTEXT_ASR_PROVIDER` | `""` | **必填指定**的唯一云端 ASR 渠道（如 `"siliconflow"` / `"mimo"` / `"cloudflare"`；触发 ASR 时未指定将直接报错阻断） |
@@ -112,7 +113,7 @@ magpie library mcp add video-context --local timeout=300 \
 | `sampling.min_interval_sec` | `VIDEO_CONTEXT_MIN_INTERVAL_SEC` | `0.8` | 相邻入选帧最小防抖间隔（秒） |
 | `sampling.max_interval_sec` | `VIDEO_CONTEXT_MAX_INTERVAL_SEC` | `15.0` | 长时间完全静止画面的最大保底间隔（秒） |
 | `sampling.max_frames` | `VIDEO_CONTEXT_MAX_FRAMES` | `180` | **全局上限**：单视频最大抽帧总数（超出时按「变化强度 × 时间间距」自动优选裁剪） |
-| `grid.cols` / `grid.rows` | `VIDEO_CONTEXT_GRID_COLS` / `VIDEO_CONTEXT_GRID_ROWS` | `3` / `3` | 网格拼图列数与行数 |
+| `grid.cols` / `grid.rows` | `VIDEO_CONTEXT_GRID_COLS` / `VIDEO_CONTEXT_GRID_ROWS` | `3` / `3` | 横屏默认 `3×3`（`640×360`）；竖屏（`9:16` / `3:4`）自动切换为 `5×2`（`360×640`），且尾图按实际帧数自动裁除空黑行 |
 | `grid.cell_width` / `grid.cell_height` | `VIDEO_CONTEXT_CELL_WIDTH` / `VIDEO_CONTEXT_CELL_HEIGHT` | `640` / `360` | 单格画面内容宽高（px，Lanczos 等比居中补黑边） |
 | `grid.header_height` | `VIDEO_CONTEXT_HEADER_HEIGHT` | `24` | 单格顶部零遮挡纯黑时间戳栏高度（px） |
 | `grid.gutter` / `grid.jpeg_quality` | `VIDEO_CONTEXT_GRID_GUTTER` / `VIDEO_CONTEXT_JPEG_QUALITY` | `8` / `85` | 分隔线宽度（px，默认 `8px` 防止视觉 Patch 跨格串行）与输出 JPEG 质量（`1–100`） |

@@ -9,7 +9,7 @@ import { mapWithConcurrency, runCommand } from '../utils/exec.js';
 /**
  * Probe video & audio stream presence, dimensions, fps, codec, and duration via ffprobe.
  */
-export async function probeVideo(videoPath) {
+export async function probeVideo(videoPath, signal = null) {
   const ffprobe = resolveBinary('ffprobe');
   const args = [
     '-v',
@@ -21,7 +21,7 @@ export async function probeVideo(videoPath) {
     videoPath,
   ];
 
-  const { stdout } = await runCommand(ffprobe, args, { timeoutMs: 20_000 });
+  const { stdout } = await runCommand(ffprobe, args, { timeoutMs: getTimeoutMs(), signal });
   const parsed = JSON.parse(stdout);
   const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
   const vStream = streams.find((s) => s.codec_type === 'video') || {};
@@ -58,7 +58,7 @@ export async function probeVideo(videoPath) {
 export async function transcodeLocalVideoToCompactCache(
   localVideoPath,
   cacheDir,
-  { targetShortSide = 360, maxFps = 30, timeoutMs = getTimeoutMs() } = {}
+  { targetShortSide = 360, maxFps = 30, timeoutMs = getTimeoutMs(), signal = null } = {}
 ) {
   await fs.promises.mkdir(cacheDir, { recursive: true });
   const outPath = path.join(cacheDir, 'source_video.mp4');
@@ -67,7 +67,7 @@ export async function transcodeLocalVideoToCompactCache(
     return outPath;
   }
 
-  const probe = await probeVideo(localVideoPath);
+  const probe = await probeVideo(localVideoPath, signal);
   if (!probe.hasVideo) {
     throw new Error(`Local file does not contain a valid video stream: "${localVideoPath}"`);
   }
@@ -108,7 +108,7 @@ export async function transcodeLocalVideoToCompactCache(
     partPath,
   ];
 
-  await runCommand(ffmpeg, args, { timeoutMs });
+  await runCommand(ffmpeg, args, { timeoutMs, signal });
   await fs.promises.rename(partPath, outPath);
   return outPath;
 }
@@ -130,6 +130,7 @@ export function scanSinglePassVideoStream(
     probeWidth = 160,
     probeHeight = 90,
     timeoutMs = getTimeoutMs(),
+    signal = null,
   } = {}
 ) {
   const ffmpeg = resolveBinary('ffmpeg');
@@ -139,7 +140,7 @@ export function scanSinglePassVideoStream(
   const frameBytes = targetW * targetH * 3;
   const safeFps = Math.min(10, Math.max(0.5, Number(probeFps) || 2.5));
 
-  // Precompute 2-sample diagonal RGB byte offsets per 160x90 luma pixel for ~0.04ms/frame downsampling
+  // Precompute 2-sample diagonal RGB byte offsets per probeWidth x probeHeight luma pixel for ~0.04ms/frame downsampling
   const probePixels = probeWidth * probeHeight;
   const offsetsA = new Uint32Array(probePixels);
   const offsetsB = new Uint32Array(probePixels);
@@ -178,6 +179,11 @@ export function scanSinglePassVideoStream(
   ];
 
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason || new Error('Single-pass video stream aborted before start'));
+      return;
+    }
+
     const child = spawn(ffmpeg, args, {
       env: getEnhancedEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -187,6 +193,15 @@ export function scanSinglePassVideoStream(
     let frameIndex = 0;
     const stderrChunks = [];
     let timedOut = false;
+    let abortedExternally = false;
+
+    const onExternalAbort = () => {
+      abortedExternally = true;
+      child.kill('SIGKILL');
+    };
+    if (signal) {
+      signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
 
     const timer =
       timeoutMs > 0
@@ -219,13 +234,20 @@ export function scanSinglePassVideoStream(
 
     child.on('error', (err) => {
       if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onExternalAbort);
       reject(err);
     });
 
     child.on('close', (code) => {
       if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onExternalAbort);
+
+      if (abortedExternally) {
+        reject(signal?.reason || new Error('Single-pass video stream interrupted by pipeline abort'));
+        return;
+      }
       if (timedOut) {
-        reject(new Error(`Single-pass video stream timed out after ${timeoutMs}ms`));
+        reject(new Error(`Single-pass video stream timed out after ${Math.round(timeoutMs / 1000)}s`));
         return;
       }
       if (code !== 0 && frameIndex === 0) {
@@ -342,6 +364,7 @@ export async function extractLanczosFrames({
   cellWidth,
   cellHeight,
   concurrency = Math.min(8, Math.max(4, os.cpus().length)),
+  signal = null,
 }) {
   const gridSpec = getGridSpec();
   const targetW = cellWidth || gridSpec.cellWidth;
@@ -351,37 +374,40 @@ export async function extractLanczosFrames({
 
   const vf = `scale=${targetW}:${targetH}:flags=lanczos:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`;
 
-  return mapWithConcurrency(samplePoints, concurrency, async (pt) => {
-    const seekSec = pt.timestampSec;
-    const outPath = path.join(
-      tempFramesDir,
-      `frame_${String(pt.frameNo).padStart(4, '0')}.jpg`
-    );
+  return mapWithConcurrency(
+    samplePoints,
+    concurrency,
+    async (pt) => {
+      const seekSec = pt.timestampSec;
+      const outPath = path.join(
+        tempFramesDir,
+        `frame_${String(pt.frameNo).padStart(4, '0')}.jpg`
+      );
 
-    const attemptExtract = async (ss) => {
-      const args = [
-        '-nostdin',
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-threads',
-        '1',
-        '-y',
-        '-ss',
-        String(Math.max(0, ss)),
-        '-i',
-        videoPath,
-        '-frames:v',
-        '1',
-        '-vf',
-        vf,
-        '-q:v',
-        '2',
-        outPath,
-      ];
-      await runCommand(ffmpeg, args, { timeoutMs: 30_000, allowNonZero: true });
-      return fs.existsSync(outPath) && fs.statSync(outPath).size > 0;
-    };
+      const attemptExtract = async (ss) => {
+        const args = [
+          '-nostdin',
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-threads',
+          '1',
+          '-y',
+          '-ss',
+          String(Math.max(0, ss)),
+          '-i',
+          videoPath,
+          '-frames:v',
+          '1',
+          '-vf',
+          vf,
+          '-q:v',
+          '2',
+          outPath,
+        ];
+        await runCommand(ffmpeg, args, { timeoutMs: getTimeoutMs(), allowNonZero: true, signal });
+        return fs.existsSync(outPath) && fs.statSync(outPath).size > 0;
+      };
 
     let ok = await attemptExtract(seekSec);
     if (!ok && seekSec > 0.25) {

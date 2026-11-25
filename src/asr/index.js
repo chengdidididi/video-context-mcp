@@ -131,11 +131,15 @@ export async function transcribeAudioMedia({
   cacheDir,
   asrConfig,
   resolvedProvider,
+  timeoutMs: budgetTimeoutMs,
+  signal = null,
+  onProgress = null,
 }) {
   const { providerName, providerCfg, protocol, adapterFn } =
     resolvedProvider || requireValidAsrProvider(asrConfig);
 
-  const prepared = await prepareAudioChunks(audioMediaPath, cacheDir, asrConfig, providerCfg);
+  if (onProgress) onProgress('slicing_audio_chunks');
+  const prepared = await prepareAudioChunks(audioMediaPath, cacheDir, asrConfig, providerCfg, signal);
   if (prepared.chunks.length === 0) {
     return {
       segments: [],
@@ -149,22 +153,39 @@ export async function transcribeAudioMedia({
     `[video-context] Running cloud ASR via [${providerName}/${protocol}] on ${prepared.chunks.length} chunk(s) (${prepared.chunkTier}, ${Math.round(prepared.durationSec)}s audio)...`
   );
 
-  const concurrency = Math.max(1, Math.min(8, Number(asrConfig.concurrency || 3)));
-  const timeoutMs = Math.max(10, Number(asrConfig.request_timeout_sec || 60)) * 1000;
+  const concurrency = Math.max(1, Math.min(12, Number(asrConfig.concurrency || 6)));
+  const configuredReqMs = Math.max(15, Number(asrConfig.request_timeout_sec || 300)) * 1000;
+  const effectiveReqMs = budgetTimeoutMs ? Math.min(configuredReqMs, budgetTimeoutMs) : configuredReqMs;
   const maxRetries = Math.max(0, Number(asrConfig.max_retries ?? 2));
   const language = asrConfig.language || 'auto';
   const prompt = asrConfig.prompt || '';
 
-  const chunkOutputs = await mapWithConcurrency(prepared.chunks, concurrency, async (chunk) => {
-    return adapterFn({
-      chunk,
-      providerCfg,
-      language,
-      prompt,
-      timeoutMs,
-      maxRetries,
-    });
-  });
+  let completedChunks = 0;
+  if (onProgress) {
+    onProgress(`0/${prepared.chunks.length} chunks (${providerName})`);
+  }
+
+  const chunkOutputs = await mapWithConcurrency(
+    prepared.chunks,
+    concurrency,
+    async (chunk) => {
+      const out = await adapterFn({
+        chunk,
+        providerCfg,
+        language,
+        prompt,
+        timeoutMs: effectiveReqMs,
+        maxRetries,
+        signal,
+      });
+      completedChunks += 1;
+      if (onProgress) {
+        onProgress(`${completedChunks}/${prepared.chunks.length} chunks (${providerName})`);
+      }
+      return out;
+    },
+    signal
+  );
 
   const rawSegments = chunkOutputs.flatMap((o) => o.segments || []);
   const mergedSegments = cleanAndMergeSegments(rawSegments);

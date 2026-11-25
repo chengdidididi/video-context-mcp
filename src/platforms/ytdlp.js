@@ -26,14 +26,14 @@ function buildBaseYtDlpArgs(platform, cookieFilePath) {
 /**
  * Dump metadata JSON via yt-dlp --dump-single-json
  */
-export async function dumpYtDlpInfo(platform, canonicalUrl, cookieFilePath) {
+export async function dumpYtDlpInfo(platform, canonicalUrl, cookieFilePath, signal = null) {
   const ytdlp = resolveBinary('yt-dlp');
   const args = [
     ...buildBaseYtDlpArgs(platform, cookieFilePath),
     '--dump-single-json',
     canonicalUrl,
   ];
-  const { stdout } = await runCommand(ytdlp, args, { timeoutMs: getTimeoutMs() });
+  const { stdout } = await runCommand(ytdlp, args, { timeoutMs: getTimeoutMs(), signal });
   return JSON.parse(stdout);
 }
 
@@ -356,6 +356,7 @@ export async function ensureCachedVideoStream({
   cookieFilePath,
   info = null,
   targetShortSide = 360,
+  signal = null,
 }) {
   return downloadYtDlpStreamWithPrefix({
     prefix: 'source_video',
@@ -366,6 +367,7 @@ export async function ensureCachedVideoStream({
     info,
     picked: info ? selectOptimalYtDlpFormat(info, targetShortSide) : null,
     fallbackSelector: VIDEO_FORMAT_SELECTOR,
+    signal,
   });
 }
 
@@ -379,6 +381,7 @@ export async function ensureCachedAudioStream({
   cookieFilePath,
   info = null,
   preferredAudioKbps = 96,
+  signal = null,
 }) {
   if (info && Array.isArray(info.formats)) {
     const hasAnyAudio = info.formats.some((f) => f && f.acodec && f.acodec !== 'none');
@@ -393,6 +396,7 @@ export async function ensureCachedAudioStream({
     info,
     picked: info ? selectOptimalYtDlpAudioFormat(info, preferredAudioKbps) : null,
     fallbackSelector: AUDIO_FORMAT_SELECTOR,
+    signal,
   });
 }
 
@@ -405,6 +409,7 @@ async function downloadYtDlpStreamWithPrefix({
   info,
   picked,
   fallbackSelector,
+  signal = null,
 }) {
   await fs.promises.mkdir(cacheDir, { recursive: true });
 
@@ -449,10 +454,11 @@ async function downloadYtDlpStreamWithPrefix({
         '-o',
         outTemplate,
       ];
-      await runCommand(ytdlp, fastArgs, { timeoutMs: getTimeoutMs() });
+      await runCommand(ytdlp, fastArgs, { timeoutMs: getTimeoutMs(), signal });
       const downloadedFast = await findCompletedFile();
       if (downloadedFast) return downloadedFast;
     } catch (err) {
+      if (signal?.aborted) throw err;
       console.error(
         `[video-context] Fast info-json download fallback (${err.message.split('\n')[0]}); retrying direct URL...`
       );
@@ -471,7 +477,7 @@ async function downloadYtDlpStreamWithPrefix({
     canonicalUrl,
   ];
 
-  await runCommand(ytdlp, args, { timeoutMs: getTimeoutMs() });
+  await runCommand(ytdlp, args, { timeoutMs: getTimeoutMs(), signal });
 
   const downloaded = await findCompletedFile();
   if (!downloaded) {

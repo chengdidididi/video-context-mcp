@@ -1,3 +1,5 @@
+import { getTimeoutMs } from '../config.js';
+
 export class AsrApiError extends Error {
   constructor(message, { status = 0, url = '', bodySnippet = '', retriable = false } = {}) {
     super(message);
@@ -11,23 +13,49 @@ export class AsrApiError extends Error {
 
 const RETRIABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason || new Error('Aborted during retry backoff'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason || new Error('Aborted during retry backoff'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export async function fetchAsrWithRetry(
   url,
   buildInit,
-  { timeoutMs = 60_000, maxRetries = 2, label = 'ASR' } = {}
+  { timeoutMs = getTimeoutMs(), maxRetries = 2, label = 'ASR', signal: parentSignal = null } = {}
 ) {
   let lastErr = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (parentSignal?.aborted) {
+      throw parentSignal.reason || new Error(`${label} aborted by pipeline timeout`);
+    }
+
     const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(new Error(`${label} request timed out after ${timeoutMs}ms`)),
-      timeoutMs
-    );
+    let timedOut = false;
+    const onParentAbort = () => {
+      controller.abort(parentSignal.reason || new Error(`${label} interrupted by pipeline abort`));
+    };
+    if (parentSignal) {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error(`${label} request timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
 
     try {
       const init = await buildInit();
@@ -50,7 +78,7 @@ export async function fetchAsrWithRetry(
           }
         );
 
-        if (retriable && attempt < maxRetries) {
+        if (retriable && attempt < maxRetries && !parentSignal?.aborted) {
           lastErr = apiErr;
           const retryAfterSec = Number(res.headers.get('retry-after') || 0);
           const delayMs =
@@ -60,7 +88,7 @@ export async function fetchAsrWithRetry(
           console.error(
             `[video-context] ${label} HTTP ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delayMs}ms...`
           );
-          await sleep(delayMs);
+          await sleep(delayMs, parentSignal);
           continue;
         }
         throw apiErr;
@@ -79,21 +107,31 @@ export async function fetchAsrWithRetry(
         json: parsedJson,
       };
     } catch (err) {
-      if (err instanceof AsrApiError && !err.retriable) {
-        throw err;
+      if (parentSignal?.aborted) {
+        throw parentSignal.reason || new Error(`${label} interrupted by pipeline timeout`);
       }
-      lastErr = err;
-      if (attempt < maxRetries) {
+      if (timedOut) {
+        lastErr = new Error(`[${label}] Request timed out after ${Math.round(timeoutMs / 1000)}s (${url})`);
+      } else if (err instanceof AsrApiError && !err.retriable) {
+        throw err;
+      } else {
+        lastErr = new Error(`[${label}] Network error (${url}): ${err?.message || String(err)}`);
+      }
+
+      if (attempt < maxRetries && !parentSignal?.aborted) {
         const delayMs = 800 * 2 ** attempt;
         console.error(
-          `[video-context] ${label} network/timeout error (${err.message}), retrying in ${delayMs}ms...`
+          `[video-context] ${label} transient error (${lastErr.message}), retrying in ${delayMs}ms...`
         );
-        await sleep(delayMs);
+        await sleep(delayMs, parentSignal);
         continue;
       }
-      throw err;
+      throw lastErr;
     } finally {
       clearTimeout(timer);
+      if (parentSignal) {
+        parentSignal.removeEventListener('abort', onParentAbort);
+      }
     }
   }
 

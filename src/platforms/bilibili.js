@@ -210,7 +210,7 @@ export async function fetchBilibiliSubtitlesAndChapters(bvid, cid, cookieHeader,
   };
 }
 
-async function fetchBilibiliPlayurlData({ bvid, cid, cookieHeader = '', wbiKeys = null }) {
+async function fetchBilibiliPlayurlData({ bvid, cid, cookieHeader = '', wbiKeys = null, signal = null }) {
   const effectiveCookies = await ensureBilibiliFingerCookies(cookieHeader);
   const params = {
     bvid,
@@ -230,6 +230,7 @@ async function fetchBilibiliPlayurlData({ bvid, cid, cookieHeader = '', wbiKeys 
   const res = await fetchWithContext(url, {
     platform: 'bilibili',
     cookieHeader: effectiveCookies,
+    signal,
   });
   const json = await res.json();
   if (json.code !== 0 || !json.data) {
@@ -249,6 +250,7 @@ export async function downloadBilibiliDashStream({
   cookieHeader = '',
   wbiKeys = null,
   targetShortSide = 360,
+  signal = null,
 }) {
   await fs.promises.mkdir(destDir, { recursive: true });
   const prefix = 'source_video';
@@ -265,6 +267,7 @@ export async function downloadBilibiliDashStream({
     cid,
     cookieHeader,
     wbiKeys,
+    signal,
   });
 
   const dashVideos = data.dash?.video || [];
@@ -273,7 +276,7 @@ export async function downloadBilibiliDashStream({
     if (!durl) throw new Error('No DASH or durl video streams returned by Bilibili playurl');
     const urls = rankBilibiliCdnUrls([durl.url, ...(durl.backup_url || [])]);
     const destPath = path.join(destDir, `${prefix}.mp4`);
-    await downloadFromMirrorList(urls, destPath, effectiveCookies);
+    await downloadFromMirrorList(urls, destPath, effectiveCookies, signal);
     return destPath;
   }
 
@@ -292,14 +295,16 @@ export async function downloadBilibiliDashStream({
 
   let lastErr = null;
   for (const cand of scored.slice(0, 4)) {
+    if (signal?.aborted) throw signal.reason || new Error('Bilibili video download aborted');
     const v = cand.stream;
     const rawUrls = [v.baseUrl || v.base_url, ...(v.backupUrl || v.backup_url || [])].filter(Boolean);
     const urls = rankBilibiliCdnUrls(rawUrls);
     const destPath = path.join(destDir, `${prefix}.m4s`);
     try {
-      await downloadFromMirrorList(urls, destPath, effectiveCookies);
+      await downloadFromMirrorList(urls, destPath, effectiveCookies, signal);
       return destPath;
     } catch (err) {
+      if (signal?.aborted) throw err;
       lastErr = err;
     }
   }
@@ -318,6 +323,7 @@ export async function downloadBilibiliDashAudio({
   cookieHeader = '',
   wbiKeys = null,
   preferredAudioKbps = 96,
+  signal = null,
 }) {
   await fs.promises.mkdir(destDir, { recursive: true });
   const prefix = 'source_audio';
@@ -334,6 +340,7 @@ export async function downloadBilibiliDashAudio({
     cid,
     cookieHeader,
     wbiKeys,
+    signal,
   });
 
   const dashAudios = [
@@ -346,7 +353,7 @@ export async function downloadBilibiliDashAudio({
     if (durl) {
       const urls = rankBilibiliCdnUrls([durl.url, ...(durl.backup_url || [])]);
       const destPath = path.join(destDir, `${prefix}.mp4`);
-      await downloadFromMirrorList(urls, destPath, effectiveCookies);
+      await downloadFromMirrorList(urls, destPath, effectiveCookies, signal);
       return destPath;
     }
     return null;
@@ -366,14 +373,16 @@ export async function downloadBilibiliDashAudio({
 
   let lastErr = null;
   for (const cand of scored.slice(0, 4)) {
+    if (signal?.aborted) throw signal.reason || new Error('Bilibili audio download aborted');
     const a = cand.stream;
     const rawUrls = [a.baseUrl || a.base_url, ...(a.backupUrl || a.backup_url || [])].filter(Boolean);
     const urls = rankBilibiliCdnUrls(rawUrls);
     const destPath = path.join(destDir, `${prefix}.m4s`);
     try {
-      await downloadFromMirrorList(urls, destPath, effectiveCookies);
+      await downloadFromMirrorList(urls, destPath, effectiveCookies, signal);
       return destPath;
     } catch (err) {
+      if (signal?.aborted) throw err;
       lastErr = err;
     }
   }
@@ -393,7 +402,7 @@ function cdnScore(u) {
   return 50;
 }
 
-async function downloadFromMirrorList(urls, destPath, cookieHeader) {
+async function downloadFromMirrorList(urls, destPath, cookieHeader, signal = null) {
   let lastErr = null;
   const partPath = `${destPath}.part`;
   const reqHeaders = {
@@ -402,14 +411,15 @@ async function downloadFromMirrorList(urls, destPath, cookieHeader) {
   };
 
   for (const rawUrl of urls) {
+    if (signal?.aborted) throw signal.reason || new Error('Bilibili mirror download aborted');
     const u = rawUrl.startsWith('//') ? `https:${rawUrl}` : rawUrl;
     try {
-      // Probe byte length via Range: bytes=0-0 (avoids single-connection post-burst CDN rate shaping!)
       const probeRes = await fetchWithContext(u, {
         platform: 'bilibili',
         cookieHeader,
-        timeoutMs: 15_000,
+        timeoutMs: 30_000,
         headers: { ...reqHeaders, Range: 'bytes=0-0' },
+        signal,
       });
 
       const contentRange = probeRes.headers.get('content-range') || '';
@@ -418,14 +428,15 @@ async function downloadFromMirrorList(urls, destPath, cookieHeader) {
       await probeRes.arrayBuffer().catch(() => {});
 
       if (probeRes.status === 206 && totalSize > 4 * 1024 * 1024) {
-        await downloadRangeChunked(u, partPath, totalSize, cookieHeader, reqHeaders);
+        await downloadRangeChunked(u, partPath, totalSize, cookieHeader, reqHeaders, signal);
       } else {
         await downloadFile(u, partPath, {
           platform: 'bilibili',
           cookieHeader,
           timeoutMs: getTimeoutMs(),
-          stallTimeoutMs: 30_000,
+          stallTimeoutMs: 45_000,
           headers: reqHeaders,
+          signal,
         });
       }
 
@@ -435,13 +446,14 @@ async function downloadFromMirrorList(urls, destPath, cookieHeader) {
         return destPath;
       }
     } catch (err) {
+      if (signal?.aborted) throw err;
       lastErr = err;
     }
   }
   throw lastErr || new Error('All Bilibili CDN mirrors failed');
 }
 
-async function downloadRangeChunked(url, partPath, totalSize, cookieHeader, extraHeaders) {
+async function downloadRangeChunked(url, partPath, totalSize, cookieHeader, extraHeaders, signal = null) {
   const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks stay inside CDN fast-start window
   const chunks = [];
   for (let start = 0; start < totalSize; start += CHUNK_SIZE) {
@@ -454,40 +466,48 @@ async function downloadRangeChunked(url, partPath, totalSize, cookieHeader, extr
   let nextMilestone = 25;
 
   try {
-    await mapWithConcurrency(chunks, 4, async (chunk) => {
-      let attemptErr = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const res = await fetchWithContext(url, {
-            platform: 'bilibili',
-            cookieHeader,
-            timeoutMs: 30_000,
-            headers: {
-              ...extraHeaders,
-              Range: `bytes=${chunk.start}-${chunk.end}`,
-            },
-          });
-          if (res.status !== 206 && res.status !== 200) {
-            throw new Error(`Unexpected status ${res.status} on Range ${chunk.start}-${chunk.end}`);
-          }
-          const buf = Buffer.from(await res.arrayBuffer());
-          await fh.write(buf, 0, buf.length, chunk.start);
+    await mapWithConcurrency(
+      chunks,
+      4,
+      async (chunk) => {
+        let attemptErr = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (signal?.aborted) throw signal.reason || new Error('Range chunk download aborted');
+          try {
+            const res = await fetchWithContext(url, {
+              platform: 'bilibili',
+              cookieHeader,
+              timeoutMs: 45_000,
+              headers: {
+                ...extraHeaders,
+                Range: `bytes=${chunk.start}-${chunk.end}`,
+              },
+              signal,
+            });
+            if (res.status !== 206 && res.status !== 200) {
+              throw new Error(`Unexpected status ${res.status} on Range ${chunk.start}-${chunk.end}`);
+            }
+            const buf = Buffer.from(await res.arrayBuffer());
+            await fh.write(buf, 0, buf.length, chunk.start);
 
-          completedBytes += buf.length;
-          const pct = Math.floor((completedBytes / totalSize) * 100);
-          if (pct >= nextMilestone) {
-            console.error(
-              `[video-context] Download progress: ${pct}% (${(completedBytes / 1048576).toFixed(1)}MB / ${(totalSize / 1048576).toFixed(1)}MB)`
-            );
-            nextMilestone = Math.floor(pct / 25) * 25 + 25;
+            completedBytes += buf.length;
+            const pct = Math.floor((completedBytes / totalSize) * 100);
+            if (pct >= nextMilestone) {
+              console.error(
+                `[video-context] Download progress: ${pct}% (${(completedBytes / 1048576).toFixed(1)}MB / ${(totalSize / 1048576).toFixed(1)}MB)`
+              );
+              nextMilestone = Math.floor(pct / 25) * 25 + 25;
+            }
+            return;
+          } catch (err) {
+            if (signal?.aborted) throw err;
+            attemptErr = err;
           }
-          return;
-        } catch (err) {
-          attemptErr = err;
         }
-      }
-      throw attemptErr;
-    });
+        throw attemptErr;
+      },
+      signal
+    );
   } finally {
     await fh.close();
   }

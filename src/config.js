@@ -27,6 +27,7 @@ export const DEFAULT_CONFIG = {
   },
   runtime: {
     timeout_sec: 300,
+    rpc_wait_sec: 45,
   },
   auth: {
     bilibili_cookie: '',
@@ -37,8 +38,8 @@ export const DEFAULT_CONFIG = {
     language: 'auto',
     prompt: '',
     max_duration_sec: 7200,
-    concurrency: 3,
-    request_timeout_sec: 60,
+    concurrency: 6,
+    request_timeout_sec: 300,
     max_retries: 2,
     providers: {
       siliconflow: {
@@ -105,6 +106,7 @@ export const ENV_VAR_MAP = {
   'output.dir': { env: 'VIDEO_CONTEXT_OUTPUT_DIR', type: 'string' },
   'output.keep_video_cache': { env: 'VIDEO_CONTEXT_KEEP_VIDEO_CACHE', type: 'boolean' },
   'runtime.timeout_sec': { env: 'VIDEO_CONTEXT_TIMEOUT_SEC', type: 'integer' },
+  'runtime.rpc_wait_sec': { env: 'VIDEO_CONTEXT_RPC_WAIT_SEC', type: 'integer' },
   'auth.bilibili_cookie': { env: 'BILIBILI_COOKIE', type: 'string' },
   'auth.allow_guest_degraded': { env: 'VIDEO_CONTEXT_ALLOW_GUEST', type: 'boolean' },
 
@@ -325,6 +327,13 @@ export function getTimeoutMs() {
   const { config } = loadEffectiveConfig();
   const sec = Number(config.runtime?.timeout_sec || 300);
   return Math.max(15, Number.isFinite(sec) ? sec : 300) * 1000;
+}
+
+export function getRpcWaitMs() {
+  const { config } = loadEffectiveConfig();
+  const sec = Number(config.runtime?.rpc_wait_sec ?? 45);
+  if (!Number.isFinite(sec) || sec <= 0) return 0;
+  return Math.max(5, sec) * 1000;
 }
 
 export function getGridSpec() {

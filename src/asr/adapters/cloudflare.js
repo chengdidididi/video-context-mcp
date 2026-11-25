@@ -8,8 +8,9 @@ export async function transcribeChunkCloudflare({
   providerCfg,
   language = 'auto',
   prompt = '',
-  timeoutMs = 60_000,
+  timeoutMs = 300_000,
   maxRetries = 2,
+  signal = null,
 }) {
   const baseUrl = String(providerCfg.base_url || 'https://api.cloudflare.com/client/v4').replace(
     /\/+$/,
@@ -49,6 +50,7 @@ export async function transcribeChunkCloudflare({
           timeoutMs,
           maxRetries,
           label: `cloudflare(${model})`,
+          signal,
         }
       );
     }
