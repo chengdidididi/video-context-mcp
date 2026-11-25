@@ -13,6 +13,7 @@ export class AsrApiError extends Error {
 
 const RETRIABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const FIXED_RETRY_DELAY_MS = 1500;
+const RATE_LIMIT_RETRY_DELAY_MS = 8000;
 
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -35,11 +36,17 @@ function sleep(ms, signal) {
 export async function fetchAsrWithRetry(
   url,
   buildInit,
-  { timeoutMs = getTimeoutMs(), maxRetries = 2, label = 'ASR', signal: parentSignal = null } = {}
+  {
+    timeoutMs = getTimeoutMs(),
+    maxRetries = 2,
+    rateLimitDelayMs = RATE_LIMIT_RETRY_DELAY_MS,
+    label = 'ASR',
+    signal: parentSignal = null,
+  } = {}
 ) {
   let lastErr = null;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     if (parentSignal?.aborted) {
       throw parentSignal.reason || new Error(`${label} aborted by pipeline timeout`);
     }
@@ -73,9 +80,12 @@ export async function fetchAsrWithRetry(
           `[${label}] HTTP ${res.status} from ${url}: ${snippet}`,
           { status: res.status, url, bodySnippet: snippet, retriable }
         );
-        if (retriable && attempt < maxRetries && !parentSignal?.aborted) {
+        // HTTP 429 RPM windows need fixed 8s x 3 cooldown; standard 5xx/408 errors use fixed 1.5s x maxRetries
+        const effectiveMaxRetries = res.status === 429 && maxRetries === 2 ? 3 : maxRetries;
+        const retryDelayMs = res.status === 429 ? rateLimitDelayMs : FIXED_RETRY_DELAY_MS;
+        if (retriable && attempt < effectiveMaxRetries && !parentSignal?.aborted) {
           lastErr = apiErr;
-          await sleep(FIXED_RETRY_DELAY_MS, parentSignal);
+          await sleep(retryDelayMs, parentSignal);
           continue;
         }
         throw apiErr;
@@ -92,14 +102,12 @@ export async function fetchAsrWithRetry(
       if (parentSignal?.aborted) {
         throw parentSignal.reason || new Error(`${label} interrupted by pipeline timeout`);
       }
-      if (err instanceof AsrApiError && !err.retriable) {
+      if (err instanceof AsrApiError) {
         throw err;
       }
       lastErr = timedOut
         ? new Error(`[${label}] Request timed out after ${Math.round(timeoutMs / 1000)}s (${url})`)
-        : err instanceof AsrApiError
-          ? err
-          : new Error(`[${label}] Network error (${url}): ${err?.message || String(err)}`);
+        : new Error(`[${label}] Network error (${url}): ${err?.message || String(err)}`);
 
       if (attempt < maxRetries && !parentSignal?.aborted) {
         await sleep(FIXED_RETRY_DELAY_MS, parentSignal);
@@ -113,8 +121,6 @@ export async function fetchAsrWithRetry(
       }
     }
   }
-
-  throw lastErr;
 }
 
 export function buildAuthHeaders(providerCfg) {

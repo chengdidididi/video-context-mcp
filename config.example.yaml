@@ -16,10 +16,10 @@ runtime:
   # 环境变量: VIDEO_CONTEXT_TIMEOUT_SEC
   timeout_sec: 300
 
-  # 单次 MCP 工具调用主动回执等待窗口（秒，默认 45s，早于常见聚合网关 50s 硬截断；设为 0 则单次阻塞等待至 timeout_sec）
+  # 单次 MCP 工具调用主动回执等待窗口（秒，默认 38s，留足 12s 余量避开常见聚合网关 50s 硬截断；设为 0 则单次阻塞等待至 timeout_sec）
   # 超过该窗口而后台仍在 300s 预算内正常运行时，主动返回 RUNNING_IN_BACKGROUND 进度引导模型无缝续接等待
   # 环境变量: VIDEO_CONTEXT_RPC_WAIT_SEC
-  rpc_wait_sec: 45
+  rpc_wait_sec: 38
 
 auth:
   # Bilibili 登录 Cookie（获取 AI 字幕 ai-zh 与 >=480p 视频流必填）

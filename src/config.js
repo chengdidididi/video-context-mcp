@@ -27,7 +27,7 @@ export const DEFAULT_CONFIG = {
   },
   runtime: {
     timeout_sec: 300,
-    rpc_wait_sec: 45,
+    rpc_wait_sec: 38,
   },
   auth: {
     bilibili_cookie: '',
@@ -331,7 +331,7 @@ export function getTimeoutMs() {
 
 export function getRpcWaitMs() {
   const { config } = loadEffectiveConfig();
-  const sec = Number(config.runtime?.rpc_wait_sec ?? 45);
+  const sec = Number(config.runtime?.rpc_wait_sec ?? 38);
   if (!Number.isFinite(sec) || sec <= 0) return 0;
   return Math.max(5, sec) * 1000;
 }

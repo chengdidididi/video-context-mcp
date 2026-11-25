@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { probeAudioStream } from './asr/audio-chunker.js';
+import { AsrApiError } from './asr/http-client.js';
 import {
   AsrConfigRequiredError,
   getAsrStatusSummary,
@@ -57,9 +58,32 @@ export class PipelineExecutionError extends Error {
   constructor(code, message, details = {}) {
     super(message);
     this.name = 'PipelineExecutionError';
-    this.code = code; // 'PIPELINE_TIMEOUT' | 'EXECUTION_ERROR'
+    this.code = code; // 'PIPELINE_TIMEOUT' | 'TRANSIENT_EXECUTION_ERROR' | 'EXECUTION_ERROR'
     this.details = details;
   }
+}
+
+function isTransientPipelineError(err) {
+  if (!err) return false;
+  if (err instanceof AsrApiError) {
+    return Boolean(err.retriable);
+  }
+  const msg = String(err.message || err);
+  if (
+    /exceeds asr\.max_duration_sec|does not contain a valid video stream|Unsupported|not found|HTTP (400|401|403|404)\b/i.test(
+      msg
+    )
+  ) {
+    return false;
+  }
+  if (
+    /\b(408|429|500|502|503|504)\b|timed out|Network error|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed/i.test(
+      msg
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 const inFlightExtractions = new Map();
@@ -250,7 +274,7 @@ async function waitWithRpcCheckpoint(job, rpcWaitMs) {
  * Unified One-Shot Video Context Pipeline with:
  *  - Unconditional in-flight singleton locking (even when `force: true` is passed on follow-up calls)
  *  - Unified 300s global AbortSignal budget across all download, FFmpeg, and ASR stages
- *  - Proactive 45s RPC checkpoint response (`RUNNING_IN_BACKGROUND`) before upstream 50s gateway cutoff
+ *  - Proactive 38s RPC checkpoint response (`RUNNING_IN_BACKGROUND`) before upstream 50s gateway cutoff
  *  - Parallel execution of `[Audio ASR]` and `[Single-Pass Two-Gate Video Scan]`
  *  - Orientation-aware grids (`5x2` `360x640` for portrait, `3x3` `640x360` for landscape) + tail row cropping
  */
@@ -928,23 +952,28 @@ async function runExtractVideoInternal(
       throw err;
     }
 
+    const hasResumableCache = Boolean(paths?.cacheDir && fs.existsSync(paths.cacheDir));
+
     if (job.timedOut && job.signal.reason instanceof PipelineExecutionError) {
       job.signal.reason.details = {
         ...job.signal.reason.details,
-        resumable_cache_preserved: Boolean(paths?.cacheDir && fs.existsSync(paths.cacheDir)),
+        retryable: false,
+        resumable_cache_preserved: hasResumableCache,
       };
       throw job.signal.reason;
     }
 
     const elapsedSec = roundSec((Date.now() - job.startedAt) / 1000, 1);
+    const retryable = hasResumableCache && isTransientPipelineError(err);
     throw new PipelineExecutionError(
-      'EXECUTION_ERROR',
+      retryable ? 'TRANSIENT_EXECUTION_ERROR' : 'EXECUTION_ERROR',
       err?.message || String(err),
       {
+        retryable,
         failed_stage: job.stage,
         stage_detail: job.stageDetail || undefined,
         elapsed_sec: elapsedSec,
-        resumable_cache_preserved: Boolean(paths?.cacheDir && fs.existsSync(paths.cacheDir)),
+        resumable_cache_preserved: hasResumableCache,
       }
     );
   } finally {

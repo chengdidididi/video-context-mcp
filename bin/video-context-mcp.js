@@ -12,7 +12,7 @@ const { values } = parseArgs({
 });
 
 if (values.version) {
-  console.log('2.4.1');
+  console.log('2.4.2');
   process.exit(0);
 }
 

@@ -20,7 +20,10 @@ Video Context MCP packages deterministic YouTube/Bilibili videos or local video 
 `.trim();
 
 const TERMINAL_ERROR_INSTRUCTION =
-  'The extraction task has terminated and incomplete output files have been cleaned up (no usable output bundle was produced for this failed run). Do NOT run shell, sleep, ls, find, or glob commands to hunt for output files; report this error reason directly to the user.';
+  'The extraction task has terminated and no usable output bundle was produced. Do NOT retry with identical parameters and do NOT run shell, sleep, ls, find, or glob commands to hunt for output files; report this error reason directly to the user.';
+
+const RESUMABLE_ERROR_INSTRUCTION =
+  'Transient upstream error occurred, but completed progress/chunks are preserved in local checkpoint cache (no usable final output files exist yet). Do NOT run shell, sleep, ls, find, or glob commands; call video_extract again with the exact same arguments to resume from the cached checkpoint (if it still fails after 2 retries, stop and report the error to the user).';
 
 function formatToolResponse(payload) {
   return {
@@ -33,12 +36,13 @@ function formatToolResponse(payload) {
   };
 }
 
-function formatToolError(err) {
+export function formatToolError(err) {
   let payload;
   if (err instanceof AuthRequiredError) {
     payload = {
       error: true,
       code: err.code,
+      retryable: false,
       message: err.message,
       auth_details: err.details,
       instruction: TERMINAL_ERROR_INSTRUCTION,
@@ -47,22 +51,26 @@ function formatToolError(err) {
     payload = {
       error: true,
       code: err.code,
+      retryable: false,
       message: err.message,
       asr_details: err.details,
       instruction: TERMINAL_ERROR_INSTRUCTION,
     };
   } else if (err instanceof PipelineExecutionError) {
+    const retryable = Boolean(err.details?.retryable);
     payload = {
       error: true,
       code: err.code,
+      retryable,
       message: err.message,
       execution_details: err.details,
-      instruction: TERMINAL_ERROR_INSTRUCTION,
+      instruction: retryable ? RESUMABLE_ERROR_INSTRUCTION : TERMINAL_ERROR_INSTRUCTION,
     };
   } else {
     payload = {
       error: true,
       code: 'EXECUTION_ERROR',
+      retryable: false,
       message: err?.message || String(err),
       instruction: TERMINAL_ERROR_INSTRUCTION,
     };
@@ -83,7 +91,7 @@ export function createVideoContextMcpServer() {
   const server = new McpServer(
     {
       name: 'video-context-mcp',
-      version: '2.4.1',
+      version: '2.4.2',
     },
     {
       instructions: SERVER_INSTRUCTIONS,
@@ -93,7 +101,7 @@ export function createVideoContextMcpServer() {
   // Tool 1: video_extract (Zero audio/ASR or reading-batch options exposed to AI)
   server.tool(
     'video_extract',
-    'One-shot video context extraction: accepts a deterministic YouTube/Bilibili URL/ID or a local video file path, writes cleaned transcript into transcript.md, runs Two-Gate visual sampling to compose timestamped grids (3x3 landscape or 5x2 portrait, 8px gutter), auto-cleans temporary cache, and returns local file paths (or RUNNING_IN_BACKGROUND checkpoint if still running at 45s within the 300s budget).',
+    'One-shot video context extraction: accepts a deterministic YouTube/Bilibili URL/ID or a local video file path, writes cleaned transcript into transcript.md, runs Two-Gate visual sampling to compose timestamped grids (3x3 landscape or 5x2 portrait, 8px gutter), auto-cleans temporary cache, and returns local file paths (or RUNNING_IN_BACKGROUND checkpoint if still running at 38s within the 300s budget).',
     {
       url_or_id: z
         .string()

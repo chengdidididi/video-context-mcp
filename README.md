@@ -99,7 +99,7 @@ magpie library mcp add video-context --local timeout=300 \
 | `output.dir` | `VIDEO_CONTEXT_OUTPUT_DIR` | `"./output"` | 产物统一输出根目录（`npx` 远程模式默认 `~/video-context-output`） |
 | `output.keep_video_cache` | `VIDEO_CONTEXT_KEEP_VIDEO_CACHE` | `false` | 拼图合成后是否保留 `cache/` 下的临时原视频流（默认 `false` 用完即焚，零原片磁盘残留） |
 | `runtime.timeout_sec` | `VIDEO_CONTEXT_TIMEOUT_SEC` | `300` | 全局统一后台总超时预算（秒，默认 5 分钟；超时或异常时自动强杀子进程、清空残缺缓存并返回结构化终态错误） |
-| `runtime.rpc_wait_sec` | `VIDEO_CONTEXT_RPC_WAIT_SEC` | `45` | 单次 MCP 调用主动检查点回执窗口（秒，早于网关 50s 硬截断返回 `RUNNING_IN_BACKGROUND` 引导续接） |
+| `runtime.rpc_wait_sec` | `VIDEO_CONTEXT_RPC_WAIT_SEC` | `38` | 单次 MCP 调用主动检查点回执窗口（秒，留足 12s 余量避开网关 50s 硬截断返回 `RUNNING_IN_BACKGROUND` 引导续接） |
 | `auth.bilibili_cookie` | `BILIBILI_COOKIE` | `""` | B 站登录 Cookie（用于获取 `ai-zh` 字幕与 >=480p 视频流；公开 YouTube 视频免配 Cookie） |
 | `auth.allow_guest_degraded` | `VIDEO_CONTEXT_ALLOW_GUEST` | `false` | 未配 B 站 Cookie 时是否允许降级为 360p 无 AI 字幕游客模式 |
 | `asr.provider` | `VIDEO_CONTEXT_ASR_PROVIDER` | `""` | **必填指定**的唯一云端 ASR 渠道（如 `"siliconflow"` / `"mimo"` / `"cloudflare"`；触发 ASR 时未指定将直接报错阻断） |
