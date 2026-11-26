@@ -143,4 +143,10 @@ output/
 
 ## 5. 架构流程图与源码导读
 
-完整的全局架构 Mermaid 流程图及全部 15 个核心源码文件的逐行号注释导读文档见 [docs/README.md](./docs/README.md)。
+完整的全局架构 Mermaid 流程图及全部核心源码文件的注释导读文档见 [docs/README.md](./docs/README.md)。
+
+---
+
+## 特别鸣谢
+
+- 感谢 [LINUX DO](https://linux.do/) 社区提供交流与开源推广平台
